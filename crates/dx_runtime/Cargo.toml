@@ -1,0 +1,31 @@
+[package]
+name        = "dx_runtime"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Shared runtime for amateur radio digital mode apps (audio capture, persistence, hamlib, paths). Designed to be reusable across msk144plus, fsk441plus, msk2k, etc."
+
+[dependencies]
+log               = { workspace = true }
+env_logger        = { workspace = true }
+anyhow            = "=1.0.86"
+chrono            = { version = "=0.4.38", default-features = false, features = ["clock"] }
+serde             = { version = "1.0", features = ["derive"] }
+toml              = "0.8"
+dirs              = "5.0"
+cpal              = "0.15"
+rubato            = "=0.15.0"
+hound             = { workspace = true }
+rusqlite          = { version = "=0.31.0", features = ["bundled"] }
+# Pin transitive `home` to 0.5.5: 0.5.12+ requires edition2024 (cargo 1.75 incompat).
+# Direct dep here is unused - just constrains the resolver. Remove once on Rust 1.78+.
+home              = "=0.5.5"
+# Same for indexmap (transitive via toml): 2.7+ needs edition2024
+indexmap          = "=2.6.0"
+# Same for mime_guess2 (transitive via webbrowser → eframe on Linux): 2.3+ needs edition2024
+mime_guess2       = "=2.0.4"
+# Same for idna_adapter (transitive via url): 1.2.2+ needs edition2024
+idna_adapter      = "=1.2.1"
+# Same for icu_normalizer_data (transitive via idna): 2.0+ needs Rust 1.82+
+icu_normalizer_data = "=1.5.0"

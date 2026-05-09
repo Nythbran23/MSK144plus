@@ -1,0 +1,24 @@
+/target/
+**/target/
+.DS_Store
+*.swp
+*~
+*.log
+/tmp/
+*.p12
+*.cer
+*.provisionprofile
+notarisation-key*
+api-key*
+AuthKey_*.p8
+.idea/
+.vscode/
+.env
+.env.local
+
+# Local backups - never commit
+crates.backup.*/
+*.zip
+*.bak
+*.tar.gz
+test_samples/

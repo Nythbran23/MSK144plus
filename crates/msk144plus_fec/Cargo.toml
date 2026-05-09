@@ -1,0 +1,9 @@
+[package]
+name        = "msk144plus_fec"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "MSK144+ fec"
+
+[dependencies]

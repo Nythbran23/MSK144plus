@@ -1,0 +1,31 @@
+[package]
+name        = "msk144plus_cli"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "MSK144+ command-line decoder"
+
+[[bin]]
+name = "msk144plus_decode"
+path = "src/main.rs"
+
+[dependencies]
+hound             = { workspace = true }
+log               = { workspace = true }
+env_logger        = { workspace = true }
+clap              = { workspace = true }
+msk144plus_dsp    = { workspace = true }
+msk144plus_engine = { workspace = true }
+msk144plus_fec    = { workspace = true }
+msk144plus_packjt = { workspace = true }
+
+[[example]]
+name = "diag_msk40"
+path = "examples/diag_msk40.rs"
+[dev-dependencies]
+num-complex = { workspace = true }
+
+[[example]]
+name = "diag_compare"
+path = "examples/diag_compare.rs"

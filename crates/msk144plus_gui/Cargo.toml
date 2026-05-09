@@ -1,0 +1,32 @@
+[package]
+name        = "msk144plus_gui"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "MSK144+ RX-only GUI"
+
+[[bin]]
+name = "msk144plus_rx"
+path = "src/main.rs"
+
+[dependencies]
+log               = { workspace = true }
+env_logger        = { workspace = true }
+anyhow            = "1.0"
+chrono            = { version = "=0.4.38", default-features = false, features = ["clock"] }
+hound             = { workspace = true }
+# Pin egui/eframe to versions that build with cargo 1.75 (no edition2024).
+egui              = "=0.24.1"
+eframe            = { version = "=0.24.1", default-features = false, features = ["default_fonts", "glow"] }
+egui_extras       = "=0.24.2"
+
+# Audio-spectrum visualisation. rustfft is the same crate already used
+# by msk144plus_dsp for the analytic filter; we use it standalone in the
+# GUI's spectrum worker (cheap windowed FFT per audio chunk for display
+# only — no signal-processing dependency on it).
+rustfft           = { workspace = true }
+num-complex       = { workspace = true }
+
+dx_runtime        = { path = "../dx_runtime" }
+msk144plus_engine = { workspace = true }

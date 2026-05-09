@@ -1,0 +1,17 @@
+[package]
+name        = "msk144plus_engine"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "MSK144+ engine"
+
+[dependencies]
+log               = { workspace = true }
+num-complex       = { workspace = true }
+msk144plus_dsp    = { workspace = true }
+msk144plus_fec    = { workspace = true }
+msk144plus_packjt = { workspace = true }
+
+[dev-dependencies]
+hound             = { workspace = true }

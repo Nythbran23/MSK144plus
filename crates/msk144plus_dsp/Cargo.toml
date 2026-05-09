@@ -1,0 +1,16 @@
+[package]
+name        = "msk144plus_dsp"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "MSK144+ dsp"
+
+[dependencies]
+num-complex       = { workspace = true }
+rustfft           = { workspace = true }
+log               = { workspace = true }
+
+[dev-dependencies]
+msk144plus_fec    = { workspace = true }
+msk144plus_packjt = { workspace = true }
