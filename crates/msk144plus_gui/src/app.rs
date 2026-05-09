@@ -429,7 +429,16 @@ impl App {
     }
 
     fn start_listening(&mut self) {
-        if self.capture_handle.is_some() { return; }
+        // Two guards. capture_handle catches the normal "already
+        // listening" case. is_listening catches the failure path
+        // where a previous start_capture failed: capture_handle
+        // wasn't set, but a tee + framer were already spawned and
+        // are still running. Without the is_listening guard, every
+        // subsequent call to start_listening (e.g. from
+        // TxEvent::Finished) would spawn ANOTHER tee + framer pair,
+        // accumulating one per TX cycle until the system collapses
+        // under the parallel decode load.
+        if self.capture_handle.is_some() || self.is_listening { return; }
 
         // Audio capture pipeline:
         //
