@@ -57,6 +57,23 @@ fn parse_cli() -> CliArgs {
 fn main() -> Result<(), eframe::Error> {
     let cli = parse_cli();
 
+    // ── 0. Configure Rayon to prevent Thread Starvation ───────────────────
+    // Get total logical cores, leave 1 for IO/UI/Hamlib
+    let available_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    
+    // Ensure we always have at least 1 thread for math
+    let rayon_threads = (available_cores - 1).max(1); 
+
+    // Build the global pool. Using unwrap() is safe here because 
+    // it's the very start of the app and nothing else has used Rayon yet.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .build_global()
+        .unwrap();
+    // ──────────────────────────────────────────────────────────────────────
+
     // ── 1. Filesystem layout ──────────────────────────────────────────────
     let paths = match &cli.config_root {
         Some(root) => Paths::new_with_root(APP_NAME, root),

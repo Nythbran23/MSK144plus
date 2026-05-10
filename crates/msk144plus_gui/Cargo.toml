@@ -30,3 +30,4 @@ num-complex       = { workspace = true }
 
 dx_runtime        = { path = "../dx_runtime" }
 msk144plus_engine = { workspace = true }
+rayon = "1.12.0"

@@ -19,6 +19,8 @@
 // relative to wall clock.
 
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters,
              SincInterpolationType, WindowFunction};
@@ -159,12 +161,29 @@ pub fn list_all_devices_diagnostic() -> Vec<String> {
 pub struct CaptureHandle {
     _stop_tx: SyncSender<()>,
     pub audio_info: String,
+    /// Per-session liveness flag. The cpal callback closures hold a
+    /// clone of this Arc and check it on every chunk; when false,
+    /// chunks are dropped at the source rather than forwarded into
+    /// `tx`. This is the ONLY reliable way to stop the audio pipeline
+    /// on macOS, where dropping the cpal::Stream is asynchronous and
+    /// the callback can keep firing for an indeterminate window
+    /// after drop. Setting `session_active = false` immediately
+    /// halts chunk delivery to all downstream consumers (tee,
+    /// framer, decoder, spectrum).
+    ///
+    /// Owned by App; cloned into every worker that needs to know
+    /// whether the current session is still alive. On Stop, App
+    /// flips this to false. On the next Listen, App allocates a
+    /// fresh Arc<AtomicBool>(true) — old workers see their old
+    /// flag stay false and exit; new workers run with the new one.
+    pub session_active: Arc<AtomicBool>,
 }
 
 pub fn start_capture(
     device_name: Option<String>,
     target_rate: u32,
     tx: AudioChunkTx,
+    session_active: Arc<AtomicBool>,
 ) -> anyhow::Result<CaptureHandle> {
     let host = cpal::default_host();
     let device = if let Some(name) = device_name {
@@ -187,7 +206,7 @@ pub fn start_capture(
 
     // ── Path 1: device supports target_rate natively → no resampling ──
     if native_rate == target_rate {
-        return start_native(&device, &dev_name, target_rate, n_channels, tx, stop_tx, stop_rx);
+        return start_native(&device, &dev_name, target_rate, n_channels, tx, stop_tx, stop_rx, session_active);
     }
 
     // Even if default isn't target_rate, the device might still support it.
@@ -198,7 +217,7 @@ pub fn start_capture(
         .unwrap_or(false);
 
     if supports_target {
-        match start_native(&device, &dev_name, target_rate, n_channels, tx.clone(), stop_tx.clone(), stop_rx) {
+        match start_native(&device, &dev_name, target_rate, n_channels, tx.clone(), stop_tx.clone(), stop_rx, session_active.clone()) {
             Ok(h) => return Ok(h),
             Err(e) => log::warn!("[AUDIO] {} Hz claimed supported but open failed: {} - falling back to {} Hz with resampling",
                 target_rate, e, native_rate),
@@ -207,7 +226,7 @@ pub fn start_capture(
 
     // ── Path 2: open at native rate, resample with rubato ──
     let (stop_tx2, stop_rx2) = std::sync::mpsc::sync_channel::<()>(1);
-    start_with_resample(&device, &dev_name, native_rate, target_rate, n_channels, tx, stop_tx2, stop_rx2)
+    start_with_resample(&device, &dev_name, native_rate, target_rate, n_channels, tx, stop_tx2, stop_rx2, session_active)
 }
 
 /// Path 1: open the device at target_rate directly. f32 first, i16 fallback.
@@ -219,6 +238,7 @@ fn start_native(
     tx: AudioChunkTx,
     stop_tx: SyncSender<()>,
     stop_rx: Receiver<()>,
+    session_active: Arc<AtomicBool>,
 ) -> anyhow::Result<CaptureHandle> {
     let cfg = cpal::StreamConfig {
         channels:    n_channels as u16,
@@ -232,9 +252,20 @@ fn start_native(
     // accepts — so there's no shared state to coordinate.
     let mut cal_f32 = CaptureCalibration::new();
     let tx1 = tx.clone();
+    let active_f32 = session_active.clone();
     let f32_result = device.build_input_stream(
         &cfg,
         move |data: &[f32], info: &cpal::InputCallbackInfo| {
+            // Session-stopped check FIRST. On macOS the cpal
+            // callback can keep firing for an indeterminate window
+            // after the stream is dropped — and on the
+            // Stop+Listen flow we want chunks to stop flowing the
+            // instant Stop is pressed, even before the stream
+            // actually shuts down. Without this check the old
+            // session's chunks leak into the new session's
+            // pipeline (when start_listening allocates a fresh
+            // tee/framer chain), causing duplicate slot drains.
+            if !active_f32.load(Ordering::Acquire) { return; }
             let mono: Vec<f32> = if ch == 1 {
                 data.iter().map(|&s| s * 32768.0).collect()
             } else {
@@ -262,9 +293,11 @@ fn start_native(
             log::warn!("[AUDIO] f32 native build failed ({}), trying i16", e_f32);
             let mut cal_i16 = CaptureCalibration::new();
             let tx2 = tx.clone();
+            let active_i16 = session_active.clone();
             device.build_input_stream(
                 &cfg,
                 move |data: &[i16], info: &cpal::InputCallbackInfo| {
+                    if !active_i16.load(Ordering::Acquire) { return; }
                     let mono: Vec<f32> = if ch == 1 {
                         data.iter().map(|&s| s as f32).collect()
                     } else {
@@ -291,6 +324,7 @@ fn start_native(
     Ok(CaptureHandle {
         _stop_tx: stop_tx,
         audio_info: format!("Capturing at {} Hz from {}", target_rate, dev_name),
+        session_active,
     })
 }
 
@@ -304,6 +338,7 @@ fn start_with_resample(
     tx: AudioChunkTx,
     stop_tx: SyncSender<()>,
     stop_rx: Receiver<()>,
+    session_active: Arc<AtomicBool>,
 ) -> anyhow::Result<CaptureHandle> {
     let cfg = cpal::StreamConfig {
         channels:    n_channels as u16,
@@ -358,11 +393,15 @@ fn start_with_resample(
         ratio, 1.02, make_params(), input_size, 1)
         .map_err(|e| anyhow::anyhow!("rubato init: {}", e))?;
     let mut buf_head_t_ms_f32: f64 = 0.0;
+    let active_f32 = session_active.clone();
 
     // f32 callback: downmix to mono, push to buffer, run resampler when full.
     let f32_result = device.build_input_stream(
         &cfg,
         move |data: &[f32], info: &cpal::InputCallbackInfo| {
+            // Session-stopped check FIRST (see start_native for full
+            // explanation). Drops chunks at source if Stop was pressed.
+            if !active_f32.load(Ordering::Acquire) { return; }
             let cb_capture_ms = cal_f32.capture_to_unix_ms(
                 info.timestamp().capture);
 
@@ -424,9 +463,11 @@ fn start_with_resample(
                 ratio, 1.02, make_params(), input_size, 1)
                 .map_err(|e| anyhow::anyhow!("rubato init (i16): {}", e))?;
             let mut buf_head_t_ms_i16: f64 = 0.0;
+            let active_i16 = session_active.clone();
             device.build_input_stream(
                 &cfg,
                 move |data: &[i16], info: &cpal::InputCallbackInfo| {
+                    if !active_i16.load(Ordering::Acquire) { return; }
                     let cb_capture_ms = cal_i16.capture_to_unix_ms(
                         info.timestamp().capture);
                     let mono: Vec<f32> = if ch == 1 {
@@ -477,6 +518,7 @@ fn start_with_resample(
         _stop_tx: stop_tx,
         audio_info: format!("Capturing at {} Hz → {} Hz from {}",
             native_rate, target_rate, dev_name),
+        session_active,
     })
 }
 

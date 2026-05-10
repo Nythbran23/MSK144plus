@@ -10,6 +10,7 @@ description = "MSK144+ dsp"
 num-complex       = { workspace = true }
 rustfft           = { workspace = true }
 log               = { workspace = true }
+rayon = "1.8"
 
 [dev-dependencies]
 msk144plus_fec    = { workspace = true }

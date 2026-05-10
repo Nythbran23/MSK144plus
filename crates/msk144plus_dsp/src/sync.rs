@@ -37,29 +37,27 @@ pub struct SyncResult {
 }
 
 /// Heterodyne `cdat` by frequency `f_shift` (Hz) at 12 kHz sample rate.
-/// Output: cdat * exp(-j*2*pi*f_shift*n / 12000).
-///
-/// Faithful port of tweak1 (called from msk144_freq_search).
-fn tweak1(cdat: &[Complex32], f_shift: f32) -> Vec<Complex32> {
-    let omega = -2.0 * PI * f_shift / 12000.0;
-    let mut out = Vec::with_capacity(cdat.len());
-    for (n, &x) in cdat.iter().enumerate() {
-        let phase = omega * n as f32;
-        let rot = Complex32::new(phase.cos(), phase.sin());
-        out.push(x * rot);
+/// Output written directly into `out` to prevent allocations.
+fn tweak1_in_place(cdat: &[Complex32], out: &mut [Complex32], f_shift: f32) {
+    // We use f64 here for the NCO to absolutely guarantee no phase or 
+    // magnitude drift over the slice, preserving mathematical robustness.
+    let omega = -2.0 * std::f64::consts::PI * (f_shift as f64) / 12000.0;
+    let phase_step = num_complex::Complex64::new(omega.cos(), omega.sin());
+    let mut rot = num_complex::Complex64::new(1.0, 0.0);
+    
+    for (&x, o) in cdat.iter().zip(out.iter_mut()) {
+        // Cast the current rotation to f32 for the signal multiplication
+        let rot32 = num_complex::Complex32::new(rot.re as f32, rot.im as f32);
+        *o = x * rot32;
+        
+        // Advance the phase via a single complex multiplication
+        rot *= phase_step; 
     }
-    out
 }
 
-/// Run the per-thread frequency search portion of msk144sync.
-///
-/// For each ferr in [if1*delf, if2*delf]:
-///   1. Heterodyne cdat to baseband by -(fc+ferr)
-///   2. Coherently sum frames where navmask=1
-///   3. Compute cyclic-shift correlation against sync waveform cb
-///   4. Track peak (xmax_thread, bestf_thread, cs_thread, xccs_thread)
-///
-/// Returns: (xmax_thread, bestf_thread, cs_thread, xccs_thread).
+use rayon::prelude::*;
+
+/// Run the parallel frequency search portion of msk144sync.
 fn freq_search(
     cdat: &[Complex32],
     fc: f32,
@@ -79,76 +77,84 @@ fn freq_search(
         0.0
     };
 
-    let mut xmax = 0.0f32;
-    let mut bestf = 0.0f32;
+    // ====================================================================
+    // STEP 1: PARALLEL SWEEP (Find the best frequency)
+    // We only return the `f32` score and frequency to prevent stack overflows.
+    // ====================================================================
+    let best_result = (if1..=if2)
+        .into_par_iter()
+        .map(|ifr| {
+            let ferr = ifr as f32 * delf;
+            let mut cdat2 = vec![Complex32::new(0.0, 0.0); cdat.len()];
+            
+            // Heterodyne in-place using the f64 NCO
+            tweak1_in_place(cdat, &mut cdat2, fc + ferr);
+
+            // Coherent sum
+            let mut c = [Complex32::new(0.0, 0.0); NSPM];
+            for i in 0..nframes {
+                if navmask[i] == 1 {
+                    let ib = i * NSPM;
+                    for k in 0..NSPM {
+                        c[k] += cdat2[ib + k];
+                    }
+                }
+            }
+
+            // Find max correlation norm for this frequency
+            let mut xmax_local = 0.0f32;
+            for ish in 0..NSPM {
+                let mut acc = Complex32::new(0.0, 0.0);
+                for j in 0..42 {
+                    let idx1 = (ish + j) % NSPM;
+                    let idx2 = (ish + 336 + j) % NSPM;
+                    let a = c[idx1] + c[idx2];
+                    acc += a.conj() * cb[j];
+                }
+                let norm = acc.norm();
+                if norm > xmax_local {
+                    xmax_local = norm;
+                }
+            }
+
+            let xb = xmax_local * fac;
+            
+            // Return only 8 bytes!
+            (xb, ferr)
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Unpack the best result
+    let (xmax, bestf) = best_result.unwrap_or((0.0, 0.0));
+
+    // ====================================================================
+    // STEP 2: SEQUENTIAL RECONSTRUCTION (Generate arrays for the winner)
+    // ====================================================================
     let mut cs_out = [Complex32::new(0.0, 0.0); NSPM];
     let mut xccs_out = [0.0f32; NSPM];
 
-    for ifr in if1..=if2 {
-        let ferr = ifr as f32 * delf;
-        // Heterodyne cdat by -(fc+ferr)
-        let cdat2 = tweak1(cdat, fc + ferr);
+    if xmax > 0.0 {
+        let mut cdat2 = vec![Complex32::new(0.0, 0.0); cdat.len()];
+        tweak1_in_place(cdat, &mut cdat2, fc + bestf);
 
-        // Coherent sum across frames marked in navmask
-        let mut c = [Complex32::new(0.0, 0.0); NSPM];
         for i in 0..nframes {
             if navmask[i] == 1 {
                 let ib = i * NSPM;
                 for k in 0..NSPM {
-                    c[k] += cdat2[ib + k];
+                    cs_out[k] += cdat2[ib + k];
                 }
             }
         }
 
-        // ct2 = [c, c]  (length 2*NSPM, for circular correlation via concatenation)
-        // Then for ish in 0..NSPM-1:
-        //   cc(ish) = dot_product(ct2(1+ish : 42+ish) + ct2(337+ish : 378+ish), cb)
-        //
-        // In Rust 0-indexed: ct2[ish..ish+42] + ct2[ish+336..ish+378]
-        // Both slices are 42 complex samples. cb is 42 samples.
-        // dot_product(a, b) in Fortran complex = sum(conjg(a)*b)
-        // BUT in this Fortran code, dot_product(a, b) for real cb is just sum(a*cb)
-        // since dot_product on real arrays is plain sum. However cb here is complex.
-        // Fortran dot_product on complex: sum(conjg(a) * b).
-        // So: cc(ish) = sum_j conjg(ct2(j) + ct2(j+336)) * cb(j)
-        //
-        // Wait — let me re-check. In msk144decodeframe.f90 we used:
-        //   cca = sum(c(1:42) * conjg(cb))
-        // That is sum(c * conjg(cb)) — same as dot_product(cb, c) in Fortran's
-        // complex dot_product convention. So dot_product order matters.
-        //
-        // In msk144_freq_search.f90 line 36:
-        //   cc(ish) = dot_product(ct2(...) + ct2(...), cb)
-        // Fortran dot_product(a, b) = sum(conjg(a) * b). So:
-        //   cc(ish) = sum(conjg(ct2_combined) * cb)
-        // = sum(conjg(ct2(j) + ct2(j+336)) * cb(j))
-        //
-        // That's the standard correlation: input·conj(template). Or equivalently
-        // conj(input)·template. Both give the same |cc|.
-        let mut cc = [Complex32::new(0.0, 0.0); NSPM];
         for ish in 0..NSPM {
             let mut acc = Complex32::new(0.0, 0.0);
             for j in 0..42 {
-                // ct2 wraps modulo NSPM (since c is repeated)
                 let idx1 = (ish + j) % NSPM;
                 let idx2 = (ish + 336 + j) % NSPM;
-                let a = c[idx1] + c[idx2];
+                let a = cs_out[idx1] + cs_out[idx2];
                 acc += a.conj() * cb[j];
             }
-            cc[ish] = acc;
-        }
-
-        // xcc = |cc|
-        let mut xcc = [0.0f32; NSPM];
-        for k in 0..NSPM {
-            xcc[k] = cc[k].norm();
-        }
-        let xb = xcc.iter().fold(0.0f32, |a, &b| a.max(b)) * fac;
-        if xb > xmax {
-            xmax = xb;
-            bestf = ferr;
-            cs_out = c;
-            xccs_out = xcc;
+            xccs_out[ish] = acc.norm();
         }
     }
 

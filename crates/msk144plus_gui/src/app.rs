@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use eframe::egui;
@@ -131,6 +132,32 @@ pub struct App {
     selected_device: Option<String>,
    capture_handle: Option<CaptureHandle>,
     audio_tx: Option<Sender<AudioChunk>>,
+
+    /// Per-listening-session liveness flag. Set to a fresh
+    /// `Arc<AtomicBool>(true)` in `start_listening`, flipped to
+    /// `false` in `tear_down_audio_pipeline`. Cloned into:
+    ///   - the cpal callback closures (audio.rs) — drops chunks at
+    ///     source when false
+    ///   - the audio tee thread (this file) — exits its forwarding
+    ///     loop when false
+    ///   - the framer + decoder-worker threads (decoder.rs) — exit
+    ///     cleanly when false
+    ///
+    /// This is the ONLY reliable way to halt the audio pipeline on
+    /// macOS, because `cpal::Stream::drop` is asynchronous: dropping
+    /// the stream does not synchronously stop the CoreAudio
+    /// callback, and the callback can keep firing for an
+    /// indeterminate window after drop. Without this flag, an old
+    /// session's callbacks would keep delivering chunks to leaked
+    /// tee/framer threads, while the new session spawns its own —
+    /// resulting in TWO framer threads decoding the same audio
+    /// (the doubled `[SLOT]` lines and `[REC] saved` × 2 we used
+    /// to see after Stop+Listen).
+    ///
+    /// Each new session gets a FRESH Arc — old workers see their
+    /// old flag stay false and exit. New workers run with the new
+    /// flag. No shared mutable state across sessions.
+    session_active: Option<Arc<AtomicBool>>,
 
     decode_rx: Option<Receiver<UiDecodeEvent>>,
     level_rx: Option<Receiver<LevelStats>>,
@@ -361,6 +388,7 @@ impl App {
             selected_device,
             capture_handle: None,
             audio_tx: None,
+            session_active: None,
             decode_rx: None,
             level_rx: None,
             spectrum_columns: Vec::new(),
@@ -468,6 +496,16 @@ impl App {
         // collide. Matches FSK441+'s working pattern. On Linux the
         // half-duplex teardown is handled inside audio.rs's
         // spawn_holder via the stop_rx channel.
+        //
+        // Allocate a fresh per-session liveness flag. Cloned into
+        // every worker that needs to know whether THIS session is
+        // still alive. On Stop / tear_down we flip this Arc's
+        // AtomicBool to false; old workers exit, the next Listen
+        // creates a new Arc with a fresh `true` so new workers run
+        // independently of the old ones. See the field-level
+        // comment on `App.session_active` for the full story.
+        let active = Arc::new(AtomicBool::new(true));
+
         let (capture_tx, capture_rx) = channel::<AudioChunk>();
         let (audio_tx, audio_rx) = channel::<AudioChunk>();
         let (spec_audio_tx, spec_audio_rx) = channel::<Vec<f32>>();
@@ -476,17 +514,44 @@ impl App {
         // Tee: forward each captured chunk to both the decoder and the
         // spectrum. Failure on either side just drops that downstream
         // (e.g. spectrum thread exits → we keep feeding the decoder).
+        //
+        // recv_timeout + session-flag check so we exit cleanly on
+        // Stop. Without this the tee would wait forever on
+        // capture_rx.recv() because the cpal callback's tx clone
+        // doesn't drop synchronously on macOS — the channel never
+        // closes — so a leaked tee thread would happily forward
+        // chunks from the dying old cpal stream into a leaked
+        // audio_tx clone, while the next Listen spawns ANOTHER
+        // tee/framer pair. That's the doubled-slot bug.
+        let active_tee = active.clone();
         std::thread::Builder::new()
             .name("msk144-audio-tee".into())
             .spawn(move || {
-                while let Ok(chunk) = capture_rx.recv() {
-                    // Decoder gets the full timestamped chunk.
-                    let samples_for_spec = chunk.samples.clone();
-                    let _ = audio_tx.send(chunk);
-                    // Spectrum just needs the audio samples.
-                    let _ = spec_audio_tx.send(samples_for_spec);
+                use std::sync::mpsc::RecvTimeoutError;
+                use std::time::Duration;
+                loop {
+                    match capture_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(chunk) => {
+                            // Decoder gets the full timestamped chunk.
+                            let samples_for_spec = chunk.samples.clone();
+                            let _ = audio_tx.send(chunk);
+                            // Spectrum just needs the audio samples.
+                            let _ = spec_audio_tx.send(samples_for_spec);
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if !active_tee.load(Ordering::Acquire) {
+                                log::info!(
+                                    "[AUDIO-TEE] exiting (session stopped)");
+                                return;
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            log::info!(
+                                "[AUDIO-TEE] exiting (capture_rx closed)");
+                            return;
+                        }
+                    }
                 }
-                log::info!("[AUDIO-TEE] capture closed, exiting");
             })
             .expect("spawn audio tee");
 
@@ -506,14 +571,16 @@ impl App {
             self.db.clone(),
             Some(self.recorder.clone()),
             Some(self.paths.clone()),
+            active.clone(),
         );
         crate::spectrum::run_spectrum_thread(spec_audio_rx, spec_col_tx);
 
-        match start_capture(self.selected_device.clone(), capture_tx.clone()) {
+        match start_capture(self.selected_device.clone(), capture_tx.clone(), active.clone()) {
             Ok(handle) => {
                 self.current_state = handle.audio_info.clone();
                 self.capture_handle = Some(handle);
                 self.audio_tx = Some(capture_tx);
+                self.session_active = Some(active);
                 self.decode_rx = Some(decode_rx);
                 self.level_rx = Some(level_rx);
                 self.spectrum_rx = Some(spec_col_rx);
@@ -561,6 +628,14 @@ impl App {
                 self.maybe_spawn_psk_reporter();
             }
             Err(e) => {
+                // start_capture failed — but we already spawned the
+                // tee, the decoder framer, and the decoder worker
+                // above (all holding clones of `active`). Flip the
+                // flag false so they exit cleanly within ~200 ms
+                // instead of becoming orphans that consume CPU
+                // until process exit. is_listening stays false so
+                // the operator can retry via the LISTEN button.
+                active.store(false, Ordering::Release);
                 self.current_state = format!("Capture error: {}", e);
                 log::error!("Capture error: {}", e);
             }
@@ -582,6 +657,26 @@ impl App {
     /// release via the `stop_rx` channel inside audio.rs::spawn_holder.
     /// That keeps the TX-cycle device juggling out of this layer.
     fn tear_down_audio_pipeline(&mut self) {
+        // FIRST: flip the session-active flag. This is the canonical
+        // signal that this listening session has ended — the cpal
+        // callback closures see it on every chunk and start dropping
+        // chunks at source; the tee/framer/decoder threads all
+        // recv_timeout on a 200 ms tick and check the flag, exiting
+        // cleanly. On macOS this is the ONLY reliable way to halt
+        // the pipeline because cpal::Stream::drop is asynchronous —
+        // the CoreAudio callback can keep firing for an
+        // indeterminate window after we drop the stream below, so
+        // relying on channel-close-propagation alone leaks workers.
+        //
+        // We `take()` the Arc out so the next start_listening
+        // allocates a FRESH Arc<AtomicBool>(true) — the old workers
+        // continue to see their old flag stay false (and exit), the
+        // new workers run with the new flag, no shared state across
+        // sessions.
+        if let Some(active) = self.session_active.take() {
+            active.store(false, Ordering::Release);
+        }
+
         // Drop the cpal capture handle. On Linux this signals
         // spawn_holder's stop_rx to return Err, the holder thread
         // exits, the cpal::Stream drops synchronously, and the
@@ -589,36 +684,24 @@ impl App {
         // parks forever (no recv), so dropping the handle here is
         // a no-op for the audio thread — but harmless because the
         // process is exiting or about to call start_listening
-        // again.
+        // again. Importantly, on macOS we don't depend on this
+        // drop to stop the audio: the session flag flipped above
+        // already halted chunk delivery from the cpal callback.
         self.capture_handle = None;
 
         // Drop our own capture_tx clone. The cpal callback still
         // holds its own clone (especially on macOS where the
         // stream isn't being released), so capture_rx may NOT
-        // return Err immediately — the tee thread might keep
-        // running past this point. That's fine; we don't
-        // synchronously wait for it. When start_listening creates
-        // a fresh pipeline it allocates new channels and a new
-        // tee, leaving any old tee to spin against a now-dead
-        // capture_tx clone (on macOS the cpal callback eventually
-        // stops on full process teardown).
-        //
-        // Earlier versions tried to wait on tee_handle.join() and
-        // framer_handle.join() here. That hung the UI on macOS
-        // because dropping cpal::Stream is asynchronous: the
-        // CoreAudio callback may continue invoking briefly after
-        // drop(), keeping the closure (and its tx clone) alive
-        // for an indeterminate window. capture_rx.recv() therefore
-        // never returns Err, the tee never exits, and join()
-        // blocks forever. The simpler "let it be" pattern matches
-        // FSK441+'s behaviour on the same hardware and works.
+        // return Err immediately — but the tee thread now exits
+        // on the session_active flag check (200 ms tick) rather
+        // than waiting for capture_rx to close. So this drop is
+        // bookkeeping rather than load-bearing.
         self.audio_tx = None;
 
         // Drop the spectrum receiver. Spectrum thread exits on
         // its own when its input channel closes (which happens
-        // when the tee eventually exits, or never, in which case
-        // it's just a parked thread of zero significance until
-        // process exit).
+        // when the tee exits — guaranteed within ~200 ms now
+        // that the flag-driven exit path is in place).
         self.spectrum_rx = None;
         self.spectrum_audio_tx = None;
         self.spectrum_columns.clear();
@@ -694,7 +777,7 @@ impl App {
         let client = dx_runtime::HamlibClient::spawn(
             self.settings.station.rigctld_host.clone(),
             self.settings.station.rigctld_port,
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
             tx,
         );
         self.hamlib = Some(Arc::new(client));
@@ -2795,15 +2878,73 @@ impl eframe::App for App {
                         self.qso.set_my_report(rpt);
                         self.start_answer_cq(call, grid_opt);
                     } else {
-                        // Non-CQ row clicked. We get the call but no
-                        // grid (only CQ rows carry one in the message
-                        // body). Preserve their_grid only if it still
-                        // belongs to this call — clicking a different
-                        // station's reply should drop the stale grid.
-                        if self.their_call != call {
-                            self.their_grid = None;
+                        // Non-CQ row clicked. Two sub-cases:
+                        //
+                        // (a) The decoded message was directed AT US
+                        //     ("<my_call> <their_call> [grid]") —
+                        //     they've already heard us, so the right
+                        //     answer is Tx2 (call+report) NOT Tx1
+                        //     (bare call). Engage AnswerCq exactly
+                        //     as for a CQ click, using the row's SNR.
+                        //     This avoids the "click row, press CALL,
+                        //     but rig still sends Tx1 bare call"
+                        //     dance — one click should engage the
+                        //     QSO and send the right message.
+                        //
+                        // (b) Third-party exchange ("OTHER1 OTHER2
+                        //     [report]") — neither call is ours.
+                        //     Just populate TARGET; let the operator
+                        //     decide whether to call OTHER2 manually.
+                        //
+                        // We re-parse the row's tokens here because
+                        // parse_clicked_row only returns the partner
+                        // call for non-CQ rows; we need msg[0] to
+                        // know whether the row was addressed to us,
+                        // and msg[2] for any grid.
+                        let row_parts: Vec<&str> = row
+                            .split_whitespace().collect();
+                        let row_msg_start = if !row_parts.is_empty()
+                            && row_parts[0].len() >= 8
+                            && row_parts[0].as_bytes()[2] == b':'
+                        {
+                            row_parts.iter().position(|t| *t == "Hz")
+                                .map(|i| (i + 1).min(row_parts.len()))
+                                .unwrap_or(row_parts.len())
+                        } else { 0 };
+                        let row_msg: &[&str] = &row_parts[row_msg_start..];
+                        let directed_at_me = !self.my_call.is_empty()
+                            && row_msg.first()
+                                .map(|t| t.eq_ignore_ascii_case(&self.my_call))
+                                .unwrap_or(false);
+
+                        if directed_at_me && row_msg.len() >= 2 {
+                            // Their call is row_msg[1]. Grid (if
+                            // any) is row_msg[2] when shaped like a
+                            // 4-char Maidenhead locator (AB12).
+                            let their_call = row_msg[1].to_uppercase();
+                            let grid_opt: Option<String> = row_msg.get(2)
+                                .filter(|s| is_grid_token(s))
+                                .map(|s| s.to_uppercase());
+
+                            let rpt = snr_opt.unwrap_or(self.qso.my_report);
+                            let rpt_str = if rpt >= 0 {
+                                format!("+{:02}", rpt)
+                            } else {
+                                format!("-{:02}", -rpt)
+                            };
+                            log::info!(
+                                "[UI] Clicked direct call → answering: \
+                                 {} grid={:?} rpt={}",
+                                their_call, grid_opt, rpt_str);
+                            self.qso.set_my_report(rpt);
+                            self.start_answer_cq(their_call, grid_opt);
+                        } else {
+                            // Third-party exchange. Set TARGET only.
+                            if self.their_call != call {
+                                self.their_grid = None;
+                            }
+                            self.their_call = call;
                         }
-                        self.their_call = call;
                     }
                 }
             }
@@ -3769,7 +3910,23 @@ fn extract_callsign(text: &str) -> Option<String> {
     if msg.len() >= 2 && looks_like_callsign(msg[0]) && looks_like_callsign(msg[1]) {
         return Some(msg[1].to_uppercase());
     }
+    // SH-format messages — the sender's callsign is encoded as a hash
+    // placeholder (e.g. "<...>") rather than transmitted in the clear.
+    // Examples:
+    //   "EU1DE/2 <...> RRR"   — someone confirmed an exchange to EU1DE/2
+    //   "<...> G4WND -01"     — someone reported -01 to me
+    // In all such cases we do NOT know who the sender is, only who they
+    // were talking TO (the recipient). Returning the recipient would be
+    // wrong: PSK Reporter would log them as "heard" when in fact we
+    // only inferred their existence from another station's traffic.
+    // Return None so the spotter skips this decode entirely.
+    if msg.iter().any(|t| t.starts_with('<') && t.ends_with('>')) {
+        return None;
+    }
     // <call>             → return <call>
+    // Only reachable when the message is a single bare callsign with
+    // no recipient and no SH hash. Rare in practice but kept as a
+    // defensive last resort.
     if looks_like_callsign(msg[0]) {
         return Some(msg[0].to_uppercase());
     }

@@ -15,6 +15,8 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use msk144plus_engine::{Depth, DecodeEvent, ShortMessageConfig};
 use dx_runtime::{Database, DecodeRecord, Recorder, Paths};
 use crate::audio::AudioChunk;
@@ -290,9 +292,57 @@ fn process_slot(
 
         if let Some(db_ref) = db {
             let parts: Vec<&str> = e.text.split_whitespace().collect();
-            let callsign: Option<String> = parts.iter()
-                .find(|t| **t != "CQ")
-                .map(|s| (*s).to_string());
+            // Extract the SENDER's callsign (the station we actually
+            // heard). Used for the DB row, the heard-stations table,
+            // and the WAV filename. Three message shapes to handle:
+            //
+            //   "CQ <call> <grid>"      → <call>
+            //   "<to> <from> <report>"  → <from>     (NOT <to> — they
+            //                                         were never heard;
+            //                                         only the from-
+            //                                         station's signal
+            //                                         reached us)
+            //   "<to> <...> <report>"   → None       (SH format: sender's
+            //                                         callsign hashed,
+            //                                         we don't know who
+            //                                         transmitted)
+            //
+            // An earlier version of this function used "first non-CQ
+            // token" which incorrectly returned <to> for two-call
+            // messages, leading to WAVs filed under the recipient's
+            // call and PSK Reporter / heard-call tracking spotting
+            // a station we never heard. Fixed to mirror app.rs's
+            // extract_callsign rules.
+            let callsign: Option<String> = if !parts.is_empty()
+                && parts[0].eq_ignore_ascii_case("CQ")
+            {
+                // CQ form — first callsign-shaped token after CQ
+                parts.iter().skip(1).find(|t| {
+                    let s = t.as_bytes();
+                    s.len() <= 10
+                        && t.chars().any(|c| c.is_ascii_alphabetic())
+                        && t.chars().any(|c| c.is_ascii_digit())
+                        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+                }).map(|s| s.to_uppercase())
+            } else if parts.len() >= 2
+                // Reject if SENDER position contains an SH hash.
+                && !(parts[1].starts_with('<') && parts[1].ends_with('>'))
+            {
+                // <to> <from> ... form — return <from> if it looks
+                // callsign-shaped, else fall through to None.
+                let cand = parts[1];
+                if cand.len() <= 10
+                    && cand.chars().any(|c| c.is_ascii_alphabetic())
+                    && cand.chars().any(|c| c.is_ascii_digit())
+                    && cand.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+                {
+                    Some(cand.to_uppercase())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let grid: Option<String> = parts.last()
                 .filter(|s| s.len() == 4
                     && s.chars().take(2).all(|c| c.is_ascii_uppercase())
@@ -439,6 +489,7 @@ pub fn run_decoder_thread(
     db: Option<Arc<Database>>,
     recorder: Option<Arc<Recorder>>,
     paths: Option<Paths>,
+    session_active: Arc<AtomicBool>,
 ) {
     // Bounded slot-job channel from framer → worker. Capacity 4 is
     // ample: a 15-s slot fills in 15 wall-clock seconds, and a worker
@@ -459,19 +510,42 @@ pub fn run_decoder_thread(
         let db_w = db.clone();
         let recorder_w = recorder.clone();
         let paths_w = paths.clone();
+        let active_w = session_active.clone();
         std::thread::Builder::new()
             .name("msk144-decoder-worker".into())
             .spawn(move || {
-                while let Ok(job) = slot_rx.recv() {
-                    process_slot(
-                        job,
-                        &decode_tx_w,
-                        db_w.as_ref(),
-                        recorder_w.as_ref(),
-                        paths_w.as_ref(),
-                    );
+                // recv_timeout pattern so we can check the session
+                // flag periodically. On Stop the framer's flag
+                // also goes false, and after the framer exits
+                // slot_rx will close and we'd exit on Disconnected
+                // anyway — but the timeout-+-flag combo is the
+                // belt-and-braces version that exits even if the
+                // framer somehow hangs.
+                loop {
+                    match slot_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(job) => {
+                            process_slot(
+                                job,
+                                &decode_tx_w,
+                                db_w.as_ref(),
+                                recorder_w.as_ref(),
+                                paths_w.as_ref(),
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if !active_w.load(Ordering::Acquire) {
+                                log::info!(
+                                    "[DECODE] worker exiting (session inactive)");
+                                return;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            log::info!(
+                                "[DECODE] worker exiting (slot_rx closed)");
+                            return;
+                        }
+                    }
                 }
-                log::info!("[DECODE] worker exiting (slot_rx closed)");
             })
             .expect("spawn decoder worker");
     }
@@ -485,7 +559,11 @@ pub fn run_decoder_thread(
     // Lives for the entire listening session — exits naturally when
     // its audio_rx returns Err (which happens at process exit when
     // the app's tee thread finally drops its sender, or on Linux at
-    // explicit pipeline teardown).
+    // explicit pipeline teardown), OR when the per-session
+    // `session_active` flag flips false (the cpal callback drops
+    // chunks at source, and the recv_timeout below catches the
+    // flag transition within ~200 ms).
+    let active_framer = session_active.clone();
     std::thread::Builder::new()
         .name("msk144-decoder".into())
         .spawn(move || {
@@ -513,8 +591,41 @@ pub fn run_decoder_thread(
                 Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
             let mut current_path: Option<std::path::PathBuf> = None;
 
+            // Helper that determines whether we should treat the
+            // current state as "audio source has gone away" — used
+            // by both the timeout-with-flag path and the
+            // disconnected-channel path. Sharing the flush logic
+            // between them is what would otherwise need a helper
+            // function; this just sets a flag and the existing
+            // Err-arm code reads it.
+            #[derive(PartialEq)]
+            enum Source { Live, Stopped, Disconnected }
+
             loop {
-                let (chunk, capture_unix_ms) = match audio_rx.recv() {
+                // recv_timeout so we can periodically check the
+                // session flag. On Stop the cpal callback's flag
+                // also goes false, so chunks stop flowing — but we
+                // can't rely on audio_rx ever returning Err on
+                // macOS (the cpal Stream isn't synchronously
+                // dropped), so the timeout path is the canonical
+                // way to notice Stop and exit cleanly.
+                let recv = audio_rx.recv_timeout(Duration::from_millis(200));
+                let source = match &recv {
+                    Ok(_) => Source::Live,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if active_framer.load(Ordering::Acquire) {
+                            // Live session, just no chunk this
+                            // tick. Loop and try again.
+                            continue;
+                        }
+                        Source::Stopped
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Source::Disconnected
+                    }
+                };
+
+                let (chunk, capture_unix_ms) = match recv {
                     Ok(AudioChunk { samples, capture_unix_ms }) => {
                         (samples, capture_unix_ms)
                     }
@@ -586,7 +697,13 @@ pub fn run_decoder_thread(
                             }
                         }
 
-                        log::info!("[DECODE] audio_rx closed, exiting");
+                        match source {
+                            Source::Stopped =>
+                                log::info!("[FRAMER] exiting (session stopped)"),
+                            Source::Disconnected =>
+                                log::info!("[FRAMER] exiting (audio_rx closed)"),
+                            Source::Live => {} // unreachable
+                        }
                         // Finalise any open WAV
                         if let Some(w) = current_writer.take() {
                             let _ = w.finalize();
