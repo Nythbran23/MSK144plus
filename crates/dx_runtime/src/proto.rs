@@ -181,6 +181,21 @@ pub fn render_payload(payload: &Payload) -> Rendered {
 pub fn render_payload_with_sh(payload: &Payload, use_sh: bool) -> Rendered {
     if use_sh {
         match payload {
+            // CallWithReport (Tx2): partner-directed call carrying our
+            // report of them. MSK40's RPT_TABLE contains the bare-report
+            // half (-03, +00, +03, +06, +10, +13, +16), so this message
+            // can be carried as a 16-bit MSK40 short message provided
+            // the report value snaps to one of those entries. The
+            // operator-side report-snap logic lives in the engine
+            // (QsoEngine::set_my_report and the manual TX UI), not here.
+            // The renderer just emits the `<from to> +NN` form; if the
+            // report doesn't match an RPT_TABLE entry exactly,
+            // pack_msk40 will reject the message and the encoder will
+            // fall back to long form anyway.
+            Payload::CallWithReport { from, to, rpt } => {
+                return Rendered::Text(format!(
+                    "<{} {}> {}", from, to, format_report(*rpt)));
+            }
             Payload::RReport { from, to, rpt } => {
                 return Rendered::Text(format!(
                     "<{} {}> R{}", from, to, format_report(*rpt)));
@@ -202,7 +217,11 @@ pub fn render_payload_with_sh(payload: &Payload, use_sh: bool) -> Rendered {
             // string and dispatch to the Rr73 handler in the QSO
             // state machine.
             Payload::Rr73 { .. } => {}
-            // CQ, Call, CallWithReport, Text fall through to long form.
+            // CQ, Call, Text fall through to long form. Note that
+            // Call (Tx1) goes long form even with use_sh because
+            // we have no partner hash yet at that point in the QSO
+            // — the receiver couldn't reverse the hash without
+            // already knowing both calls.
             _ => {}
         }
     }

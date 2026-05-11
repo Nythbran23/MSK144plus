@@ -677,6 +677,7 @@ dependencies = [
  "indexmap",
  "log",
  "mime_guess2",
+ "msk144plus_packjt",
  "rubato",
  "rusqlite",
  "serde",

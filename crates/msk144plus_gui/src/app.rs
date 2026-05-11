@@ -127,6 +127,18 @@ pub struct App {
     is_calling_cq: bool,
     in_active_qso: bool,
     is_transmitting: bool,
+    /// Hard global TX gate. Defaults to true (TX permitted) on
+    /// startup so existing operating habits aren't disrupted. When
+    /// the operator toggles this OFF in the UI, every Action::Transmit
+    /// emitted by the QSO engine is suppressed at the apply_engine_output
+    /// funnel — the engine still tracks state, partner data, and decode
+    /// activity, but no audio leaves the rig. Useful for monitoring
+    /// the band, recording, spotting, or testing without committing
+    /// to TX. Toggling back ON resumes TX from whatever state the
+    /// engine is in (no resync needed). Suppression is logged at
+    /// info level so the operator can audit "why didn't TX fire" in
+    /// the log without confusion.
+    tx_enabled: bool,
 
     available_devices: Vec<String>,
     selected_device: Option<String>,
@@ -384,6 +396,10 @@ impl App {
             is_calling_cq: false,
             in_active_qso: false,
             is_transmitting: false,
+            // TX gate defaults to enabled so operators who don't
+            // know the toggle exists get the same behaviour as
+            // before this feature was added.
+            tx_enabled: true,
             available_devices: devs,
             selected_device,
             capture_handle: None,
@@ -1221,7 +1237,22 @@ impl App {
             let s = self.manual_tx_rpt_str.trim();
             let parsed = s.trim_start_matches('+').parse::<i16>();
             if let Ok(n) = parsed {
-                let q = (2 * (n / 2)).clamp(-4, 24);
+                // When the next outgoing message will go via MSK40
+                // (Sh form) — either operator-enabled or forced by a
+                // non-standard partner — the report has to come from
+                // the MSK40 RPT_TABLE: -3, 0, +3, +6, +10, +13, +16.
+                // Snap the operator's typed value to the nearest legal
+                // entry. Without this, typing "-04" against a non-
+                // standard partner would fail to pack and the message
+                // would silently fall back to long form (which can't
+                // carry the report). When MSK40 is NOT required, fall
+                // back to the original even-step quantisation in
+                // -4..24 used for full MSK144 messages.
+                let q = if self.qso.msk40_required() {
+                    dx_runtime::qso::snap_report_to_msk40(n)
+                } else {
+                    (2 * (n / 2)).clamp(-4, 24)
+                };
                 self.manual_tx_rpt = q;
                 self.manual_tx_rpt_str = if q >= 0 {
                     format!("+{:02}", q)
@@ -1258,6 +1289,35 @@ impl App {
     }
 
     fn apply_manual_tx_override(&mut self, state: dx_runtime::qso::QsoState) {
+        // Defensive re-parse of the typed Rpt field BEFORE we read
+        // `self.manual_tx_rpt`. The Manual TX dropdown sits ABOVE the
+        // Rpt field in the layout, so egui paints the dropdown first
+        // within a single frame. If the operator types a new report
+        // value (e.g. "-05") and clicks the Manual TX dropdown to
+        // select Tx3 in one motion — without first tabbing out of
+        // the Rpt field — egui's frame order means the dropdown's
+        // click handler (this function) runs BEFORE the Rpt field's
+        // lost_focus parse runs that frame. Without this guard we'd
+        // pass the previous frame's value (often the default +00)
+        // to the engine, and the operator would see TX go out with
+        // the wrong R-report. Re-parsing the string here is cheap,
+        // idempotent, and removes the operator-action ordering
+        // dependency. The field's lost_focus block still runs after
+        // us on the same frame; it'll write the same value back,
+        // which is a no-op.
+        //
+        // Snap to MSK40 RPT_TABLE if the next message will go via Sh
+        // (operator-enabled or non-standard partner) — same logic
+        // as the Rpt field's own parse. Belt-and-braces.
+        let s = self.manual_tx_rpt_str.trim();
+        if let Ok(n) = s.trim_start_matches('+').parse::<i16>() {
+            self.manual_tx_rpt = if self.qso.msk40_required() {
+                dx_runtime::qso::snap_report_to_msk40(n)
+            } else {
+                (2 * (n / 2)).clamp(-4, 24)
+            };
+        }
+
         // Make sure the listener is up so we can hear partner's reply
         // — same logic as start_call_target. Without RX, we'd send the
         // override message into the void with no way to advance.
@@ -1522,16 +1582,31 @@ impl App {
     fn apply_engine_output(&mut self, action: Action, events: Vec<EngineEvent>) {
         // Action: schedule the next outgoing message
         if let Action::Transmit(env) = action {
-            // Lazy-spawn the transmitter if it isn't running yet. This
-            // is the canonical re-entry point after a hamlib reconnect
-            // dropped the old transmitter — by the time we get here,
-            // self.hamlib is in its current (correct) state, so the
-            // newly-spawned transmitter snapshots a working hamlib
-            // handle and PTT works.
-            self.ensure_transmitter();
-            if let Some(tx) = &self.transmitter {
-                tx.set_message(env.raw.clone());
-                tx.set_mode(crate::transmitter::TxMode::Active);
+            // Hard TX gate: when the operator has toggled TX Enable off,
+            // suppress the actual transmitter call. Engine state,
+            // partner data, and UI events still propagate via the
+            // `events` loop below — the operator sees "Engine
+            // would TX: ..." in the log so they can confirm the
+            // engine logic is correct, but no audio leaves the rig.
+            // Toggling TX Enable back on resumes from wherever the
+            // engine currently is; no resync needed.
+            if !self.tx_enabled {
+                log::info!("[TX-GATE] suppressed (TX Enable off): \"{}\"",
+                    env.raw);
+                self.current_state =
+                    format!("TX Enable OFF — suppressed: {}", env.raw);
+            } else {
+                // Lazy-spawn the transmitter if it isn't running yet.
+                // This is the canonical re-entry point after a hamlib
+                // reconnect dropped the old transmitter — by the time
+                // we get here, self.hamlib is in its current (correct)
+                // state, so the newly-spawned transmitter snapshots a
+                // working hamlib handle and PTT works.
+                self.ensure_transmitter();
+                if let Some(tx) = &self.transmitter {
+                    tx.set_message(env.raw.clone());
+                    tx.set_mode(crate::transmitter::TxMode::Active);
+                }
             }
         }
         // Events: drive UI
@@ -2456,8 +2531,91 @@ impl eframe::App for App {
                     if self.is_listening { self.stop(); } else { self.start_listening(); }
                 }
 
-                let cq_btn = ui.add_sized([90.0, 30.0],
-                    egui::Button::new("📢 CALL CQ").fill(if self.is_calling_cq { green } else { dim }));
+                // TX Enable — global TX gate. Sits between LISTEN and
+                // CALL CQ to match the natural left-to-right operating
+                // order: bring up RX, decide whether TX is permitted,
+                // then start a QSO. Green/labelled "TX ON" when
+                // permitted, red/labelled "TX OFF" when suppressed.
+                // When OFF, the QSO engine still runs (decodes, state
+                // transitions, partner tracking) but nothing reaches
+                // the transmitter — `apply_engine_output` short-circuits
+                // Action::Transmit. Useful for monitor-only operation,
+                // band recording, spotting runs, or testing engine
+                // behaviour without committing to QSOs. Red = unusual
+                // state (safe-by-loud), green = normal operation.
+                let red = egui::Color32::from_rgb(140, 50, 50);
+                let tx_btn_label = if self.tx_enabled { "📡 TX ON" } else { "🚫 TX OFF" };
+                let tx_btn_fill = if self.tx_enabled { green } else { red };
+                let tx_btn_tip = if self.tx_enabled {
+                    "TX permitted. Click to disable all TX without\n\
+                     stopping the QSO engine. Engine continues to\n\
+                     track decodes and transitions; only the actual\n\
+                     transmission is suppressed."
+                } else {
+                    "TX SUPPRESSED. Engine logic continues to run\n\
+                     but no audio reaches the rig. Click to re-enable.\n\
+                     When re-enabled, TX resumes from current engine\n\
+                     state (no resync needed)."
+                };
+                if ui.add_sized([90.0, 30.0],
+                    egui::Button::new(tx_btn_label).fill(tx_btn_fill))
+                    .on_hover_text(tx_btn_tip)
+                    .clicked()
+                {
+                    self.tx_enabled = !self.tx_enabled;
+                    log::info!("[UI] TX Enable → {}",
+                        if self.tx_enabled { "ON" } else { "OFF" });
+                    // If we just disabled TX while a transmitter is
+                    // mid-cycle, force it back to Idle mode so the
+                    // currently-queued message doesn't fire on the
+                    // next slot. Without this the engine has already
+                    // queued an Action::Transmit; the transmitter
+                    // would still send it on the next slot boundary
+                    // until apply_engine_output's gate intervenes
+                    // on the NEXT engine output. Setting Idle mode
+                    // explicitly halts TX immediately.
+                    if !self.tx_enabled {
+                        if let Some(tx) = &self.transmitter {
+                            tx.set_mode(crate::transmitter::TxMode::Idle);
+                        }
+                        // Also abort any active TX intent (CQ, mid-QSO,
+                        // manual override). Without this, turning TX
+                        // back on later would silently resume whatever
+                        // the engine was sending — surprising. Operator
+                        // explicitly re-engages CQ / QSO when ready.
+                        if self.is_calling_cq || self.in_active_qso {
+                            let (action, events) =
+                                self.qso.on_intent(dx_runtime::qso::Intent::Abort);
+                            self.apply_engine_output(action, events);
+                            self.is_calling_cq = false;
+                            self.in_active_qso = false;
+                        }
+                        self.current_state =
+                            "TX Enable OFF — engine suppressed".to_string();
+                    } else {
+                        self.current_state =
+                            "TX Enable ON".to_string();
+                    }
+                }
+
+                // CALL CQ — disabled when TX Enable is off, since
+                // calling CQ implies actually transmitting and we'd
+                // otherwise queue a CQ that the TX gate immediately
+                // suppresses (confusing). egui's add_enabled greys the
+                // button and blocks clicks. The hover tooltip explains
+                // why so the operator knows where to look.
+                let cq_btn = ui.add_enabled(
+                    self.tx_enabled,
+                    egui::Button::new("📢 CALL CQ")
+                        .fill(if self.is_calling_cq && self.tx_enabled { green } else { dim })
+                        .min_size(egui::Vec2::new(90.0, 30.0)),
+                );
+                let cq_btn = if !self.tx_enabled {
+                    cq_btn.on_hover_text(
+                        "TX Enable is OFF — enable TX to call CQ.")
+                } else {
+                    cq_btn
+                };
                 if cq_btn.clicked() {
                     if self.is_calling_cq {
                         self.stop_tx();

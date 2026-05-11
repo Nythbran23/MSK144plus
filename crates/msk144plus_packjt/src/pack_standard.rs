@@ -100,7 +100,24 @@ fn pack_call_to_n28(call: &Call) -> Option<u32> {
             // and pack28_standard should produce that range directly.
             Some(n22)
         }
-        Call::Hash22(_) => None, // requires i3=4
+        // A 22-bit hash of a non-standard or bracketed callsign,
+        // packed into the 28-bit call slot of an i3=1 / i3=2 message.
+        // This is how WSJT-X transmits messages like `<S50TA> GW4WND
+        // R-04`: the bracketed callsign is hashed to 22 bits and the
+        // 28-bit call slot carries `NTOKENS + n22`. The receiver
+        // recognises `n28 - NTOKENS < MAX22` as a hash, looks it up
+        // in its recent-calls table, and renders the original call
+        // back (in brackets, e.g. `<S50TA>`, or `<...>` if unresolved).
+        // This is the key mechanism that allows non-standard
+        // callsigns to participate in the structured exchange (grid,
+        // signal report, R-report) — which i3=4 alone cannot carry.
+        // Source: lib/77bit/packjt77.f90 `pack28` function, both the
+        // `c13(1:1).eq.'<'` branch (explicit brackets) and the
+        // auto-detect branch for unbracketed non-standard calls.
+        Call::Hash22(n22) => {
+            const NTOKENS_U32: u32 = 2_063_592;
+            Some(NTOKENS_U32 + n22)
+        }
         Call::Invalid => None,
     }
 }
@@ -215,8 +232,15 @@ mod tests {
     }
 
     #[test]
-    fn hash22_call_rejects() {
-        // A Hash22 call must use i3=4, not i3=1/2
+    fn hash22_call_accepts() {
+        // A Hash22 call IS valid in i3=1/2 — packed into the 28-bit
+        // call slot as `NTOKENS + n22`. This is how WSJT-X transmits
+        // messages like `<S50TA> GW4WND R-04`: the bracketed call is
+        // hashed and packed standardly. Receiver recognises the hash
+        // by `n28 - NTOKENS < MAX22` and looks up the original call
+        // in their recent-decoded table. Older code rejected this
+        // because i3=4 was assumed to be the only path for non-
+        // standard calls — but that mishandles the grid/report cases.
         let msg = StandardMessage {
             call_1: Call::Hash22(12345),
             call_1_rover: false,
@@ -226,6 +250,12 @@ mod tests {
             exchange: Exchange::Grid("FN42".to_string()),
             variant: MsgVariant::NaVhf,
         };
-        assert_eq!(pack_standard(&msg).unwrap_err(), PackError::Call1Invalid);
+        let payload = pack_standard(&msg).expect("Hash22 + grid should pack");
+        // call slot 1 should hold NTOKENS + 12345 = 2_063_592 + 12345
+        let n28a = crate::bits::read_be(&payload, 0, 28);
+        assert_eq!(n28a, 2_063_592 + 12345);
+        // i3 in bits 74..77 should be 1 (NaVhf)
+        let i3 = crate::bits::read_be(&payload, 74, 3);
+        assert_eq!(i3, 1);
     }
 }

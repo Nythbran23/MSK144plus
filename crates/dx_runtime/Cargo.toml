@@ -7,6 +7,7 @@ license     = { workspace = true }
 description = "Shared runtime for amateur radio digital mode apps (audio capture, persistence, hamlib, paths). Designed to be reusable across msk144plus, fsk441plus, msk2k, etc."
 
 [dependencies]
+msk144plus_packjt = { workspace = true }
 log               = { workspace = true }
 env_logger        = { workspace = true }
 anyhow            = "=1.0.86"

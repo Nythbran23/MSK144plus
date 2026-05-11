@@ -31,7 +31,19 @@ pub fn pack77(text: &str) -> [u8; 77] {
     if let Some(p) = try_pack_standard(&normalised, MsgVariant::NaVhf) { return p; }
     if let Some(p) = try_pack_standard(&normalised, MsgVariant::EuVhf) { return p; }
 
+    // Auto-detect non-standard callsign and pack as i3=4. Catches the case
+    // where neither standard variant accepted the message because one or
+    // both callsigns don't fit the [A-Z]{1,2}[0-9]{1}[A-Z]{1,3} pattern
+    // (e.g. S50TA, 9A1ABC, 3D2RD). Without this, those messages would
+    // silently fall through to free-text encoding which doesn't preserve
+    // the exchange or message type and breaks QSO with the partner.
+    if let Some(p) = try_pack_nonstandard_auto(&normalised) { return p; }
+
     // Fall back to free text. Must produce a payload with i3=0, n3=0.
+    // The caller can detect this by unpacking the result and checking
+    // the message variant; structured messages we couldn't encode
+    // (e.g. "S50TA GW4WND IO82" — i3=4 has no grid field) end up
+    // here and the partner sees text-only instead of structured data.
     pack_free_text_77(&normalised)
 }
 
@@ -110,6 +122,107 @@ fn try_pack_nonstandard(msg: &str) -> Option<[u8; 77]> {
     Some(pack_nonstandard_full(n12, compound, iflip, nrpt, icq))
 }
 
+/// Auto-detect a non-standard callsign in a structured message and pack
+/// it as i3=4 (compound + hash). Triggered after both standard variants
+/// (NaVhf, EuVhf) have failed — those reject calls that don't fit the
+/// `[A-Z]{1,2}[0-9]{1}[A-Z]{1,3}` pattern, but real-world traffic uses
+/// many calls outside that pattern (Slovenian S5x, Croatian 9A1, Fiji
+/// 3D2, Korean HL, Indonesian YB, etc.). Without this fallback those
+/// messages would slide into free-text encoding which doesn't preserve
+/// structure and breaks QSO sequencing with the partner.
+///
+/// The i3=4 wire format is structurally limited: it carries ONE
+/// callsign verbatim (the "compound", up to 11 chars) plus the OTHER
+/// callsign as a 12-bit hash that the receiver looks up in their
+/// recently-decoded list. Critically, **i3=4 has no field for grids or
+/// signal reports**. So if the message contains a grid or +/- report,
+/// we return None and let the caller drop to free text. This matches
+/// WSJT-X behaviour: QSOs with non-standard callsigns proceed via
+/// abbreviated CQ→Call→RR73→73 sequences without exchanging reports.
+///
+/// Supported shapes:
+///   "CQ S50TA"               icq=1, compound=S50TA, hash=0
+///   "S50TA GW4WND"           iflip=0, hash=hash12(GW4WND), compound=S50TA
+///   "GW4WND S50TA"           iflip=1, hash=hash12(GW4WND), compound=S50TA
+///   "S50TA GW4WND RR73"      as call+call but with nrpt=2
+///   "S50TA GW4WND 73"        nrpt=3
+///   "S50TA GW4WND RRR"       nrpt=1
+///
+/// Unsupported (returns None):
+///   anything containing a grid (e.g. "S50TA GW4WND IO82")
+///   anything containing a +/- report (e.g. "S50TA GW4WND -04")
+///   anything containing an R-report (e.g. "S50TA GW4WND R+05")
+///
+/// "compound" in i3=4 means "the call printed verbatim on the wire".
+/// It does NOT mean "callsign with a / portable suffix" — the alphabet
+/// happens to include `/` so portable forms like `PJ4/KA1ABC` also
+/// pack into this slot, but the slot is used for ANY call that fits
+/// in the 11-char base-38 alphabet.
+fn try_pack_nonstandard_auto(msg: &str) -> Option<[u8; 77]> {
+    let words: Vec<&str> = msg.split_whitespace().collect();
+    if words.len() < 2 || words.len() > 3 { return None; }
+
+    // CQ form: "CQ <compound>"
+    if words[0] == "CQ" {
+        if words.len() != 2 { return None; }
+        let compound = words[1];
+        if !is_valid_compound_call(compound) { return None; }
+        return Some(pack_nonstandard_full(0, compound, 0, 0, 1));
+    }
+
+    // Two-call form: <call1> <call2> [optional ack]
+    let call1 = words[0];
+    let call2 = words[1];
+
+    // Determine which side is non-standard. If both are standard, this
+    // path shouldn't have been reached — try_pack_standard would have
+    // succeeded. If both are non-standard, i3=4 still works (we hash
+    // one and put the other verbatim) but we have to pick which.
+    // Convention: non-standard one goes verbatim (compound), standard
+    // one is hashed. If both non-standard, use call2 as compound (the
+    // partner's call, which the receiver knows verbatim because it's
+    // their own call).
+    let call1_standard = crate::callsign::pack28_standard(call1).is_some();
+    let call2_standard = crate::callsign::pack28_standard(call2).is_some();
+
+    let (compound, hashed_call, iflip) = match (call1_standard, call2_standard) {
+        (true, true) => return None,        // both standard — caller mistake
+        (false, true) => (call1, call2, 1), // call1 non-std verbatim, hash=call2 (FROM)
+        (true, false) => (call2, call1, 0), // call2 non-std verbatim, hash=call1 (TO)
+        (false, false) => (call2, call1, 0),// both non-std — pick call2 as verbatim
+    };
+
+    if !is_valid_compound_call(compound) { return None; }
+
+    // Optional 3rd token is an ack code — anything else (grid, report,
+    // R-report) is unsupported in i3=4 and forces fall-through to free
+    // text. The caller will log a warning so the operator sees that the
+    // message couldn't be encoded structurally.
+    let nrpt = if words.len() == 3 {
+        match words[2] {
+            "RRR" => 1u8,
+            "RR73" => 2u8,
+            "73" => 3u8,
+            _ => return None,  // grid or report — i3=4 can't carry these
+        }
+    } else {
+        0u8
+    };
+
+    let n12 = crate::jenkins::hash12(
+        &crate::jenkins::format_call_pair(hashed_call, ""));
+    Some(pack_nonstandard_full(n12, compound, iflip, nrpt, 0))
+}
+
+/// Quick sanity check: does this string fit in the 11-char base-38
+/// compound-call alphabet (digits, letters, slash, space)? Used to
+/// reject malformed input before pack_nonstandard_full silently
+/// substitutes spaces for invalid characters.
+fn is_valid_compound_call(s: &str) -> bool {
+    if s.is_empty() || s.len() > 11 { return false; }
+    s.bytes().all(|c| crate::nonstandard::COMPOUND_ALPHABET.contains(&c))
+}
+
 /// Attempt to pack as a standard i3=1 (NA VHF) or i3=2 (EU VHF) message.
 fn try_pack_standard(msg: &str, variant: MsgVariant) -> Option<[u8; 77]> {
     let words: Vec<&str> = msg.split_whitespace().collect();
@@ -127,9 +240,12 @@ fn try_pack_standard(msg: &str, variant: MsgVariant) -> Option<[u8; 77]> {
     // call_2 is words[call_2_idx]
     if call_2_idx >= words.len() { return None; }
     let (call_2, call_2_rover) = parse_callsign_with_rover(words[call_2_idx], suffix);
+    // call_2 must be either a standard call or a hash-form (bracketed
+    // or auto-hashed non-standard). Reject anything else (CQ / DE / QRZ
+    // in call_2 position is invalid in i3=1/2).
     let call_2 = match call_2 {
-        Call::Standard(_) => call_2,
-        _ => return None, // call_2 must be a real callsign
+        Call::Standard(_) | Call::Hash22(_) => call_2,
+        _ => return None,
     };
 
     // Exchange may be present at words[call_2_idx+1] possibly preceded
@@ -235,20 +351,72 @@ fn parse_first_field(words: &[&str], rover_suffix: &str) -> Option<(Call, bool, 
         return Some((Call::Qrz, false, 1));
     }
 
-    // Plain callsign (possibly with rover)
+    // Bracketed callsign — e.g. `<S50TA>`. Pack as 22-bit hash into the
+    // 28-bit call slot. This is the canonical WSJT-X mechanism for
+    // including a non-standard callsign in a structured i3=1/2 message
+    // that also carries a grid, signal report, or R-report. The receiver
+    // recognises `n28 < NTOKENS + MAX22` as a hash and looks up the
+    // original callsign in their recent-decoded list. Source:
+    // packjt77.f90 `pack28` function, the `c13(1:1).eq.'<'` branch.
+    if words[0].starts_with('<') && words[0].ends_with('>') && words[0].len() >= 3 {
+        let inner = &words[0][1..words[0].len() - 1];
+        let n22 = crate::jenkins::hash22(inner);
+        return Some((Call::Hash22(n22), false, 1));
+    }
+
+    // Plain callsign (possibly with rover or non-standard auto-hash)
     let (call, rover) = parse_callsign_with_rover(words[0], rover_suffix);
     match call {
-        Call::Standard(_) => Some((call, rover, 1)),
+        Call::Standard(_) | Call::Hash22(_) => Some((call, rover, 1)),
         _ => None,
     }
 }
 
 /// Strip rover suffix and return (Call, had_suffix).
+///
+/// Recognises three callsign forms:
+///   1. `<XYZ>` — bracketed → Call::Hash22(hash22(XYZ))
+///   2. Standard pattern (e.g. K1ABC, GW4WND) → Call::Standard
+///   3. Non-standard (e.g. S50TA, 9A1ABC, 3D2RD) → Call::Hash22(hash22)
+///
+/// Case 3 mirrors WSJT-X's auto-hash logic in packjt77.f90 pack28:
+/// when a callsign doesn't fit the standard
+/// `[A-Z]{1,2}[0-9]{1}[A-Z]{1,3}` pattern, pack28 silently hashes it
+/// to 22 bits and packs the hash into the n28 slot. The receiver
+/// looks it up by hash in their recent-calls table and displays the
+/// resolved call (or `<...>` if no match). This is what lets messages
+/// like `S50TA GW4WND R-04` (no brackets in the source) encode as a
+/// valid i3=1 packet — the encoder transparently hashes S50TA.
+///
+/// Bracketed form is a deliberate-by-operator choice to hash a call
+/// that COULD be packed standardly. Both forms produce the same wire
+/// representation; the brackets just tell the encoder "use the hash
+/// path even if you don't have to". Standard calls (call_1 or call_2)
+/// in the same message are NOT bracketed.
 fn parse_callsign_with_rover(s: &str, suffix: &str) -> (Call, bool) {
-    if let Some(stripped) = s.strip_suffix(suffix) {
-        return (Call::Standard(stripped.to_string()), true);
+    // Bracketed form first: `<XYZ>` → hash22
+    if s.starts_with('<') && s.ends_with('>') && s.len() >= 3 {
+        let inner = &s[1..s.len() - 1];
+        let n22 = crate::jenkins::hash22(inner);
+        return (Call::Hash22(n22), false);
     }
-    (Call::Standard(s.to_string()), false)
+    // Strip rover suffix (only applies to plain-text callsigns, not
+    // bracketed — WSJT-X disallows `<X/P>` and so do we).
+    let (base, rover) = if let Some(stripped) = s.strip_suffix(suffix) {
+        (stripped, true)
+    } else {
+        (s, false)
+    };
+    // Try standard pattern via the same predicate the i3=1/2 packer
+    // uses (pack28_standard returns Some iff standard). When it
+    // returns None, the call is non-standard and we auto-hash —
+    // matching WSJT-X's pack28 fallback branch.
+    if pack28_standard(base).is_some() {
+        (Call::Standard(base.to_string()), rover)
+    } else {
+        let n22 = crate::jenkins::hash22(base);
+        (Call::Hash22(n22), rover)
+    }
 }
 
 /// Parse an exchange field (grid, signal report, or ack token).
@@ -373,4 +541,174 @@ mod tests {
             other => panic!("expected Standard, got {:?}", other),
         }
     }
+
+    // ─── i3=4 auto-fallback tests for non-standard callsigns ─────────
+    //
+    // These exercise the new try_pack_nonstandard_auto path. The
+    // canonical use case is QSO with calls that don't fit the
+    // standard `[A-Z]{1,2}[0-9]{1}[A-Z]{1,3}` pattern: Slovenian S5x,
+    // Croatian 9A1, Fiji 3D2, Korean HL, etc. Without this path
+    // those messages used to silently fall through to free-text
+    // encoding which produces gibberish on the partner's decoder.
+
+    #[test]
+    fn nonstandard_cq() {
+        // CQ with non-standard callsign. Receiver sees "CQ S50TA"
+        // — the icq=1 flag tells them the call after "CQ" is the
+        // calling station.
+        let bits = pack77("CQ S50TA");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(ns) => {
+                assert!(ns.is_cq, "icq flag should be set for CQ form");
+                assert_eq!(ns.compound_call, "S50TA");
+                assert_eq!(ns.ack, crate::nonstandard::NonstandardAck::None);
+            }
+            other => panic!("expected Nonstandard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nonstandard_call_call_no_exchange() {
+        // "S50TA GW4WND" — partner-to-me from a non-standard call.
+        // Encodes as: hash=hash12(GW4WND), compound=S50TA, iflip=1
+        // (so receiver displays compound on the LEFT and hash on the
+        // RIGHT). Without recent_calls hash resolves to "<...>".
+        let bits = pack77("S50TA GW4WND");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(ns) => {
+                assert_eq!(ns.compound_call, "S50TA");
+                assert_eq!(ns.ack, crate::nonstandard::NonstandardAck::None);
+                assert!(!ns.is_cq);
+            }
+            other => panic!("expected Nonstandard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nonstandard_call_call_rr73() {
+        let bits = pack77("S50TA GW4WND RR73");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(ns) => {
+                assert_eq!(ns.compound_call, "S50TA");
+                assert_eq!(ns.ack, crate::nonstandard::NonstandardAck::Rr73);
+            }
+            other => panic!("expected Nonstandard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nonstandard_call_call_73() {
+        let bits = pack77("S50TA GW4WND 73");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(ns) => {
+                assert_eq!(ns.compound_call, "S50TA");
+                assert_eq!(ns.ack, crate::nonstandard::NonstandardAck::Bare73);
+            }
+            other => panic!("expected Nonstandard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nonstandard_call_call_rrr() {
+        let bits = pack77("S50TA GW4WND RRR");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(ns) => {
+                assert_eq!(ns.compound_call, "S50TA");
+                assert_eq!(ns.ack, crate::nonstandard::NonstandardAck::Rrr);
+            }
+            other => panic!("expected Nonstandard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nonstandard_grid_falls_back_to_free_text() {
+        // i3=4 has no grid field — "S50TA GW4WND IO82" cannot be
+        // structurally encoded and falls through to free text. The
+        // operator sees a warning logged at the pack77 level.
+        // Free-text encoding doesn't preserve structure, so the
+        // partner sees the text but no parsed payload type.
+        let bits = pack77("S50TA GW4WND IO82");
+        let msg = unpack77(&bits);
+        // Must NOT be Nonstandard (i3=4 can't carry grids).
+        match msg {
+            Message::Nonstandard(_) => panic!("grid should not encode as i3=4"),
+            _ => {}  // free text, or whatever else the unpacker decides
+        }
+    }
+
+    #[test]
+    fn nonstandard_report_falls_back_to_free_text() {
+        // Same — reports cannot be carried in i3=4.
+        let bits = pack77("S50TA GW4WND -04");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(_) => panic!("report should not encode as i3=4"),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn nonstandard_r_report_falls_back_to_free_text() {
+        // R-reports also unsupported in i3=4.
+        let bits = pack77("S50TA GW4WND R+05");
+        let msg = unpack77(&bits);
+        match msg {
+            Message::Nonstandard(_) => panic!("R-report should not encode as i3=4"),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn nonstandard_partner_call_resolves_via_hash_lookup() {
+        // Confirm that on the receiving side, if the recent-calls
+        // ledger contains the partner call, the hash resolves and
+        // the displayed text contains the real callsign in <>.
+        let bits = pack77("S50TA GW4WND RR73");
+        // Read back with recent_calls hint. The unpack77 in the
+        // crate root may not take a recent_calls slice directly,
+        // but unpack_nonstandard does. Test that path explicitly.
+        let msg = crate::nonstandard::unpack_nonstandard(
+            &bits[..77],
+            Some(&["GW4WND".to_string()]),
+        ).expect("should unpack");
+        // Should contain the resolved partner call, the compound
+        // (S50TA), and RR73.
+        assert!(msg.text.contains("S50TA"),
+            "expected text to contain S50TA: {:?}", msg.text);
+        assert!(msg.text.contains("GW4WND"),
+            "hash should resolve to GW4WND: {:?}", msg.text);
+        assert!(msg.text.contains("RR73"),
+            "RR73 ack should be in text: {:?}", msg.text);
+    }
+
+    #[test]
+    fn slovenian_5_prefix_packs_nonstandard() {
+        // S50TA, S57XYZ — Slovenian calls have prefix S5.
+        let bits = pack77("S57XYZ GW4WND RR73");
+        match unpack77(&bits) {
+            Message::Nonstandard(ns) => {
+                assert_eq!(ns.compound_call, "S57XYZ");
+            }
+            other => panic!("S57XYZ should be nonstandard, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn croatian_9a_prefix_packs_nonstandard() {
+        // 9A1 Croatian. Digit-first prefix, doesn't fit the 1-2 letter
+        // standard prefix pattern.
+        let bits = pack77("9A1ABC GW4WND RR73");
+        match unpack77(&bits) {
+            Message::Nonstandard(ns) => {
+                assert_eq!(ns.compound_call, "9A1ABC");
+            }
+            other => panic!("9A1ABC should be nonstandard, got {:?}", other),
+        }
+    }
 }
+

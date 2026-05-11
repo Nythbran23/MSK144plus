@@ -165,6 +165,46 @@ impl QsoEngine {
     pub fn set_band(&mut self, band: String)          { self.band = band; }
     pub fn set_freq_mhz(&mut self, f: Option<f64>)    { self.freq_mhz = f; }
 
+    /// True when the next outgoing message will be carried by MSK40
+    /// (Sh form), i.e. when the operator has manually enabled Sh AND
+    /// a partner is established (so the call pair can be hashed).
+    ///
+    /// Note: this is NOT triggered by non-standard partner callsigns
+    /// any more. Non-standard calls (S5x, 9A1, 3D2, etc.) are handled
+    /// at the packjt layer by hashing into the 28-bit call slot of a
+    /// standard i3=1/2 message — exactly as WSJT-X does in pack28's
+    /// auto-hash branch. So MSK40 (Sh) is a pure operator-choice
+    /// compression-mode toggle, not a workaround for non-standard
+    /// callsign limits in the wire protocol. The UI uses this flag
+    /// to constrain the manual Rpt field to MSK40-legal values
+    /// (snap to nearest of -3, 0, +3, +6, +10, +13, +16) while Sh
+    /// is engaged.
+    pub fn msk40_required(&self) -> bool {
+        self.use_short_msg && self.their_call.is_some()
+    }
+
+    /// The signal report we should put in our next outgoing TX.
+    ///
+    /// When MSK40 (Sh) is active, the report is constrained to one of
+    /// the 7 bare-report values in MSK40's RPT_TABLE: -3, 0, +3, +6,
+    /// +10, +13, +16. We snap the operator's `my_report` to the
+    /// nearest legal entry so the MSK40 packer accepts it. When Sh
+    /// is NOT active (standard i3=1/2 path), the full ±NN range is
+    /// available and we return `my_report` verbatim — even with a
+    /// non-standard partner, because the hash22-in-call-slot
+    /// mechanism (packjt77.f90 pack28 auto-hash branch) lets i3=1/2
+    /// carry the full structured exchange for any call type.
+    ///
+    /// The snap happens transparently at TX time without mutating
+    /// the stored `my_report` value.
+    fn tx_report(&self) -> i16 {
+        if self.msk40_required() {
+            snap_report_to_msk40(self.my_report)
+        } else {
+            self.my_report
+        }
+    }
+
     /// Return our grid in the form the on-air protocol accepts: a
     /// 4-character field-square locator (e.g. "IO82"). The operator's
     /// settings may hold a 6-character extended locator (e.g.
@@ -392,12 +432,12 @@ impl QsoEngine {
                     QsoState::SendingReport =>
                         Payload::CallWithReport {
                             from: self.my_call.clone(),
-                            to, rpt: self.my_report,
+                            to, rpt: self.tx_report(),
                         },
                     QsoState::SendingRReport =>
                         Payload::RReport {
                             from: self.my_call.clone(),
-                            to, rpt: self.my_report,
+                            to, rpt: self.tx_report(),
                         },
                     // Tx4 (RR73): semantically means "send the
                     // combined acknowledge + sign-off". Engine state
@@ -481,7 +521,7 @@ impl QsoEngine {
                 let payload = Payload::CallWithReport {
                     from: self.my_call.clone(),
                     to: from.clone(),
-                    rpt: self.my_report,
+                    rpt: self.tx_report(),
                 };
                 let action = Action::Transmit(self.make_tx(payload, &mut ev));
                 self.transition(QsoState::SendingReport, &mut ev);
@@ -496,7 +536,7 @@ impl QsoEngine {
                 let payload = Payload::RReport {
                     from: self.my_call.clone(),
                     to: from.clone(),
-                    rpt: self.my_report,
+                    rpt: self.tx_report(),
                 };
                 let action = Action::Transmit(self.make_tx(payload, &mut ev));
                 self.transition(QsoState::SendingRReport, &mut ev);
@@ -511,7 +551,7 @@ impl QsoEngine {
                 let payload = Payload::RReport {
                     from: self.my_call.clone(),
                     to: from.clone(),
-                    rpt: self.my_report,
+                    rpt: self.tx_report(),
                 };
                 let action = Action::Transmit(self.make_tx(payload, &mut ev));
                 self.transition(QsoState::SendingRReport, &mut ev);
@@ -525,7 +565,7 @@ impl QsoEngine {
                 let payload = Payload::RReport {
                     from: self.my_call.clone(),
                     to: from.clone(),
-                    rpt: self.my_report,
+                    rpt: self.tx_report(),
                 };
                 let action = Action::Transmit(self.make_tx(payload, &mut ev));
                 self.transition(QsoState::SendingRReport, &mut ev);
@@ -733,12 +773,12 @@ impl QsoEngine {
             QsoState::SendingReport => Some(Payload::CallWithReport {
                 from: self.my_call.clone(),
                 to: self.their_call.clone()?,
-                rpt: self.my_report,
+                rpt: self.tx_report(),
             }),
             QsoState::SendingRReport => Some(Payload::RReport {
                 from: self.my_call.clone(),
                 to: self.their_call.clone()?,
-                rpt: self.my_report,
+                rpt: self.tx_report(),
             }),
             QsoState::SendingRr => Some(Payload::Rr {
                 from: self.my_call.clone(),
@@ -794,11 +834,21 @@ impl QsoEngine {
 
     fn make_tx(&mut self, payload: Payload, ev: &mut Vec<EngineEvent>) -> TxEnvelope {
         let format = payload.format();
-        // Sh form is only emitted when both (a) the user has Sh on,
-        // and (b) we have a partner call established. The renderer
-        // restricts Sh form to RReport / Rr / SeventyThree internally
-        // — CQ, Call, CallWithReport always use long form even with
-        // Sh enabled (those messages can't be hashed).
+        // Sh form is emitted ONLY when the operator has manually
+        // enabled Sh AND a partner is established. The renderer
+        // restricts Sh to message types MSK40 can carry (RReport,
+        // Rr, SeventyThree, CallWithReport). Other types fall back
+        // to long form even when use_sh=true.
+        //
+        // Note: non-standard partner callsigns no longer force Sh.
+        // The standard i3=1/2 path handles non-standard calls via
+        // the hash22-in-28-bit-call-slot mechanism (packjt77.f90
+        // pack28 auto-hash branch), which supports the full
+        // structured exchange (grid, signal report, R-report) for
+        // any call type. MSK40 (Sh) is now purely the operator's
+        // compression-mode choice — useful for higher-repetition-
+        // rate marginal QSOs, but not required for non-standard
+        // partners.
         let use_sh = self.use_short_msg && self.their_call.is_some();
         let raw = match render_payload_with_sh(&payload, use_sh) {
             Rendered::Text(s) => s,
@@ -821,6 +871,58 @@ impl QsoEngine {
 }
 
 fn normalize_call(s: &str) -> String { s.trim().to_uppercase() }
+
+/// Is this callsign non-standard for the WSJT-X i3=1/2 packers?
+///
+/// Standard form is `[A-Z]{1,2}[0-9]{1}[A-Z]{1,3}` — a 1-2 letter prefix,
+/// exactly one digit, then a 1-3 letter suffix (e.g. K1ABC, GW4WND, VK2A).
+/// Calls outside that pattern (S50TA — letter+digit+digit+letters,
+/// 9A1ABC — digit-first prefix, 3D2RD — digit prefix with letter,
+/// PJ4/KA1ABC — portable suffix) are "non-standard". WSJT-X handles
+/// these by hashing the callsign to 22 bits and packing the hash into
+/// the 28-bit call slot of an otherwise-standard i3=1/2 message — see
+/// packjt77.f90 pack28 auto-hash branch.
+///
+/// This function exists for diagnostic/logging use; the actual hash
+/// substitution is done at the packjt layer by pack28_anycall and
+/// parse_callsign_with_rover in pack77.rs.
+#[allow(dead_code)]
+pub fn is_nonstandard_call(call: &str) -> bool {
+    msk144plus_packjt::callsign::pack28_standard(call).is_none()
+}
+
+/// Snap a signal-report value to the nearest MSK40 RPT_TABLE entry.
+///
+/// MSK40's report field is 4 bits selecting from a fixed 16-entry table:
+///   bare reports: -03, +00, +03, +06, +10, +13, +16
+///   R-reports:    R-03, R+00, R+03, R+06, R+10, R+13, R+16
+///   ack tokens:   RRR, 73
+///
+/// The bare-report half is what we send during Tx2 (CallWithReport).
+/// When the engine auto-engages a QSO with a non-standard partner, our
+/// internal `my_report` value (typically -4 by default for marginal
+/// MSK144 conditions) won't match any RPT_TABLE entry exactly. Without
+/// snapping, pack_msk40 would reject the message and the encoder would
+/// fall back to long form — which can't carry the report at all because
+/// the partner is non-standard.
+///
+/// Returns the closest RPT_TABLE bare-report value to the input. Ties
+/// break toward zero (e.g. ±1.5 → 0). Out-of-range values clamp to
+/// the table extremes (-3 or +16).
+pub fn snap_report_to_msk40(rpt: i16) -> i16 {
+    // MSK40 bare-report values from RPT_TABLE indices 0..7.
+    const VALID: [i16; 7] = [-3, 0, 3, 6, 10, 13, 16];
+    let mut best = VALID[0];
+    let mut best_d = (rpt - VALID[0]).abs();
+    for &v in &VALID[1..] {
+        let d = (rpt - v).abs();
+        if d < best_d {
+            best = v;
+            best_d = d;
+        }
+    }
+    best
+}
 
 #[cfg(test)]
 mod tests {
