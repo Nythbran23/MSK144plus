@@ -2624,6 +2624,72 @@ impl eframe::App for App {
                     }
                 }
 
+                // LOG QSO — manual completion. Enabled whenever the
+                // engine has a partner (state is one of CallingStn /
+                // SendingReport / SendingRReport / SendingRr /
+                // Sending73). Clicking commits whatever QSO data we
+                // have to the logbook (ADIF + DB), halts TX, and
+                // returns to Idle. Useful when:
+                //   - Partner stopped responding mid-exchange but
+                //     enough was exchanged to count
+                //   - Band conditions died, want to log the partial
+                //     QSO and listen for new openings
+                //   - Auto-state-machine isn't progressing as
+                //     expected (e.g. missed pings) but operator is
+                //     confident the partner heard enough
+                // Amber colour distinguishes it from green (active
+                // operations) and red (stop/abort) — it's a
+                // deliberate completion action, distinct from both.
+                let has_loggable_qso = self.in_active_qso
+                    && !matches!(
+                        self.qso.state,
+                        dx_runtime::qso::QsoState::Idle
+                            | dx_runtime::qso::QsoState::Listening
+                            | dx_runtime::qso::QsoState::CallingCq
+                            | dx_runtime::qso::QsoState::Done,
+                    );
+                let amber = egui::Color32::from_rgb(180, 130, 40);
+                let log_btn = ui.add_enabled(
+                    has_loggable_qso,
+                    egui::Button::new("📝 LOG QSO")
+                        .fill(if has_loggable_qso { amber } else { dim })
+                        .min_size(egui::Vec2::new(90.0, 30.0)),
+                );
+                let log_btn = if !has_loggable_qso {
+                    log_btn.on_hover_text(
+                        "No active QSO to log.\n\
+                         Click becomes available when a QSO with a\n\
+                         partner callsign is in progress.")
+                } else {
+                    log_btn.on_hover_text(
+                        "Manually log this QSO and stop.\n\
+                         Records whatever exchange data has been\n\
+                         received so far (partner call, grid, report)\n\
+                         to the ADIF file and database. Halts TX\n\
+                         immediately. Use when the auto-state-machine\n\
+                         isn't progressing but enough was exchanged\n\
+                         to count as a valid QSO.")
+                };
+                if log_btn.clicked() {
+                    log::info!("[UI] manual Log & End requested");
+                    // Halt any in-flight TX before logging — operator
+                    // wants the QSO committed and the rig back to
+                    // RX-only. We don't change tx_enabled (the global
+                    // gate) — that's an orthogonal preference.
+                    if let Some(tx) = &self.transmitter {
+                        tx.set_mode(crate::transmitter::TxMode::Idle);
+                    }
+                    let (action, events) =
+                        self.qso.on_intent(dx_runtime::qso::Intent::LogAndEnd);
+                    self.apply_engine_output(action, events);
+                    // Clear active-QSO / CQ flags so the UI immediately
+                    // reflects "we're done". The engine has transitioned
+                    // to Done internally; mirror that in app state.
+                    self.is_calling_cq = false;
+                    self.in_active_qso = false;
+                    self.current_state = "QSO logged manually".to_string();
+                }
+
                 ui.add_space(20.0);
                 ui.label("TARGET:");
                 ui.horizontal(|ui| {

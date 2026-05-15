@@ -79,6 +79,24 @@ pub enum Intent {
     Call { their: String },
     AnswerCq { their: String, rpt: i16, grid: Option<String> },
     Abort,
+    /// Operator-driven "log this QSO now and stop". Used when the
+    /// auto-state-machine isn't progressing (e.g. partner stopped
+    /// responding mid-exchange, or band conditions died) but enough
+    /// data was exchanged that the operator wants to commit the QSO
+    /// record. Closes the partner-engaged states (`CallingStn`,
+    /// `SendingReport`, `SendingRReport`, `SendingRr`, `Sending73`)
+    /// by stamping qso_end_utc_ms, building a QsoRecord from current
+    /// engine fields, emitting `QsoComplete`, and transitioning to
+    /// `Done`. A no-op (and clears any active TX) when state has
+    /// no partner data (`Idle`, `Listening`, `CallingCq`, `Done`).
+    ///
+    /// The resulting ADIF record will be partial if the QSO didn't
+    /// complete the full exchange — for example, if both calls were
+    /// established but no R-report ever came back, the RST_RCVD
+    /// field will be blank. That's intentional: a partial record is
+    /// more useful than no record. Operators can clean these up by
+    /// editing the ADIF file directly or in their logbook viewer.
+    LogAndEnd,
 }
 
 #[allow(dead_code)]
@@ -227,17 +245,25 @@ impl QsoEngine {
 
     /// Set the slot period (15 or 30 seconds) and adjust `max_repeats`
     /// so QSO timeouts feel similar in wall-clock seconds regardless
-    /// of period. With 15s slots, 5 repeats = 75 s of TX before giving
-    /// up. Doubling slot length without halving the count would make
-    /// QSOs drag for 150 s of repeated 73s on 30s slots, which is
-    /// excessive — a typical MS QSO works or doesn't within ~2 min
-    /// of a final being heard.
+    /// of period.
+    ///
+    /// Meteor scatter pings are sporadic — partners' final 73 may
+    /// arrive on the 7th or 8th ping when nothing happened on the
+    /// first 6. So a "give up after N cycles" threshold needs to be
+    /// generous enough that we don't prematurely log incomplete QSOs.
+    /// 5 minutes (10 cycles at 30s) is a reasonable upper bound: it's
+    /// long enough to catch the ping that brings the partner's 73,
+    /// but short enough that the operator isn't TXing into the void
+    /// forever after the band has died.
+    ///
+    /// Operators who want a different timeout can use the manual
+    /// "Log & End" button to close the QSO before max_repeats fires.
     ///
     /// Mapping:
-    ///   15 s slots → max_repeats = 5  (75 s window)
-    ///   30 s slots → max_repeats = 3  (90 s window — still generous)
+    ///   15 s slots → max_repeats = 12 (3 min window)
+    ///   30 s slots → max_repeats = 10 (5 min window)
     pub fn set_slot_period(&mut self, period_secs: u32) {
-        self.max_repeats = if period_secs >= 30 { 6 } else { 6 };
+        self.max_repeats = if period_secs >= 30 { 10 } else { 12 };
     }
 
     fn mark_qso_start(&mut self) {
@@ -316,6 +342,44 @@ impl QsoEngine {
                 };
                 action = Action::Transmit(self.make_tx(payload, &mut ev));
                 self.transition(QsoState::SendingReport, &mut ev);
+            }
+            // Operator pressed "Log & End". Stop any active TX and log
+            // whatever data we have for this QSO. The handler is liberal
+            // about what counts as a "loggable" QSO — anything that has
+            // a partner callsign set goes into the log. The downstream
+            // QsoRecord constructor decides which fields are populated
+            // based on which state we reached (e.g. RST_RCVD only when
+            // we got past SendingRReport). States with no partner are
+            // a no-op except for clearing the engine.
+            Intent::LogAndEnd => {
+                let has_partner = self.their_call.is_some()
+                    && !matches!(
+                        self.state,
+                        QsoState::Idle
+                            | QsoState::Listening
+                            | QsoState::CallingCq
+                            | QsoState::Done,
+                    );
+                if has_partner {
+                    self.qso_end_utc_ms = Some(utc_ms_now());
+                    let their = self.their_call.clone().unwrap_or_default();
+                    let record = self.make_qso_record();
+                    ev.push(EngineEvent::Info(format!(
+                        "QSO with {} logged manually (state: {})",
+                        their, self.state
+                    )));
+                    ev.push(EngineEvent::QsoComplete { their, record });
+                    self.transition(QsoState::Done, &mut ev);
+                } else {
+                    // No partner — just emit an info event so the UI
+                    // can show "nothing to log". Reset engine so the
+                    // operator's mental model matches: button click =
+                    // back to idle, even if we couldn't log.
+                    ev.push(EngineEvent::Info(
+                        "Log & End: no active QSO to log".into()));
+                    self.reset_qso();
+                    self.transition(QsoState::Idle, &mut ev);
+                }
             }
         }
         (action, ev)

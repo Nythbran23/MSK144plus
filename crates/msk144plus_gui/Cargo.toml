@@ -31,3 +31,20 @@ num-complex       = { workspace = true }
 dx_runtime        = { path = "../dx_runtime" }
 msk144plus_engine = { workspace = true }
 rayon = "1.12.0"
+
+[package.metadata.bundle]
+name = "MSK144plus"
+identifier = "uk.thedxshop.msk144plus"
+short_description = "MSK144 meteor scatter transceiver"
+long_description = """
+MSK144 meteor scatter decoder and transceiver for amateur radio.
+Real-time decoding via RTL-SDR or sound card, with full QSO
+state machine and ADIF logging.
+"""
+copyright = "Copyright (c) 2026 Roger Banks GW4WND"
+category = "public.app-category.utilities"
+# Optional but nice:
+# icon = ["assets/icon.icns"]
+osx_minimum_system_version = "11.0"
+[package.metadata.bundle.osx_info_plist_extras]
+NSMicrophoneUsageDescription = "MSK144plus needs microphone access to receive audio from your radio's CODEC for decoding MSK144 signals."
