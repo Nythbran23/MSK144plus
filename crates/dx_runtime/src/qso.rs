@@ -731,17 +731,39 @@ impl QsoEngine {
                 self.transition(QsoState::Done, &mut ev);
                 return (Action::None, ev);
             }
-            // Sending73 — partner sent RR73 as their final. Same as 73:
-            // close on our next-or-already-sent 73.
+            // Sending73 — partner sent RR73 (their Tx4 confirmation).
+            // We were sending RR73 ourselves; receiving theirs confirms
+            // that our RR73 was received AND that they have all the
+            // confirmation they need. The QSO is now valid per IARU R1
+            // rules on both sides.
+            //
+            // Switch to sending plain 73 (Tx5) for up to max_repeats
+            // periods as a polite final close. Don't log yet — the
+            // check_complete path will auto-log when the plain-73
+            // timeout fires. Operator can also click LOG QSO at any
+            // time to log immediately.
+            //
+            // Note: this is distinct from receiving plain 73 (handled
+            // above), which logs immediately because plain 73 is the
+            // explicit "I'm done" signal — no further response needed.
+            // Receiving RR73 means partner expects (or accepts) one
+            // more 73 from us as the goodwill close.
             (QsoState::Sending73, Payload::Rr73 { from, to })
                 if self.is_me(to) && is_from_partner && self.tx_repeat_count >= 1 =>
             {
-                self.qso_end_utc_ms = Some(utc_ms_now());
+                ev.push(EngineEvent::Info(
+                    "Partner sent RR73 — switching to plain 73 for final close".into()));
+                self.final_is_rr73 = false;
+                self.tx_repeat_count = 0;
                 let their = from.clone();
-                let record = self.make_qso_record();
-                ev.push(EngineEvent::QsoComplete { their, record });
-                self.transition(QsoState::Done, &mut ev);
-                return (Action::None, ev);
+                let payload = Payload::SeventyThree {
+                    from: self.my_call.clone(),
+                    to: their,
+                };
+                let action = Action::Transmit(self.make_tx(payload, &mut ev));
+                // Stay in Sending73 — the state name covers both RR73
+                // and plain 73 sending; final_is_rr73 flag distinguishes.
+                return (action, ev);
             }
             // Sending73 — partner moved on (CQ or calling someone else): early-complete
             (QsoState::Sending73, Payload::Cq { from, .. }) if is_from_partner => {
@@ -850,18 +872,41 @@ impl QsoEngine {
             }),
             QsoState::Sending73 => {
                 self.tx_repeat_count += 1;
-                if self.tx_repeat_count > self.max_repeats { return None; }
                 let to = self.their_call.clone()?;
                 if self.final_is_rr73 {
-                    // Modern path: we entered Sending73 because partner
-                    // sent us R+rpt (or operator picked Tx4=RR73).
-                    // Keep emitting RR73 across repeat slots.
+                    // We're sending RR73 (Tx4 — confirmation message).
+                    // Per IARU R1 procedure (VHF Handbook §4.4), a valid
+                    // MS QSO requires both stations to receive an
+                    // unambiguous confirmation. Our partner has sent us
+                    // an R-report or RRR/RR73 already (that's how we
+                    // got to Sending73). But THEY don't yet know if we
+                    // received it — our RR73 is what tells them. If our
+                    // RR73 is missed, they keep re-sending their R-report
+                    // expecting our confirmation. Therefore we must keep
+                    // emitting RR73 until partner indicates they got it
+                    // (by sending 73, by going CQ, or by calling another
+                    // station). No timeout here — we wait indefinitely
+                    // for partner's response. The watchdog timer (60-min
+                    // global TX limit) and the operator's STOP / LOG QSO
+                    // buttons provide the safety nets.
                     Some(Payload::Rr73 {
                         from: self.my_call.clone(),
                         to,
                     })
                 } else {
-                    // Legacy path or operator picked Tx5=73. Plain 73.
+                    // We're sending plain 73 (Tx5 — polite optional
+                    // final close). This is the message after we've
+                    // already received the partner's RR73 (their Tx4)
+                    // and want to acknowledge it back. The QSO is
+                    // already valid by IARU R1 rules at this point —
+                    // partner has confirmed AND we have confirmed. So
+                    // this is just goodwill, and a hard 6-period
+                    // timeout is correct: if they don't hear our 73,
+                    // it doesn't invalidate the QSO. After max_repeats
+                    // the check_complete handler auto-logs and stops.
+                    if self.tx_repeat_count > self.max_repeats {
+                        return None;
+                    }
                     Some(Payload::SeventyThree {
                         from: self.my_call.clone(),
                         to,
@@ -873,9 +918,24 @@ impl QsoEngine {
     }
 
     /// Called periodically by the app tick loop.
-    /// If we've hit max_repeats on 73 without confirmation, complete the QSO.
+    ///
+    /// Auto-completes the QSO ONLY when we've been sending plain 73
+    /// (Tx5) for max_repeats periods. In that situation the QSO is
+    /// already valid per IARU R1 rules — partner has explicitly
+    /// confirmed (we're sending Tx5 because we received their RR73 or
+    /// 73 earlier) — and the 73 is just polite goodwill, so giving up
+    /// after a few cycles of no response is fine.
+    ///
+    /// **Never auto-completes from sending RR73 (Tx4).** That path
+    /// requires partner's response (their 73, CQ, or call-other) to
+    /// confirm IARU R1 validity. We wait indefinitely; the watchdog
+    /// timer or operator's STOP / LOG QSO buttons are the only ways
+    /// out.
     pub fn check_complete(&mut self) -> Option<EngineEvent> {
-        if self.state == QsoState::Sending73 && self.tx_repeat_count > self.max_repeats {
+        if self.state == QsoState::Sending73
+            && !self.final_is_rr73
+            && self.tx_repeat_count > self.max_repeats
+        {
             self.qso_end_utc_ms = Some(utc_ms_now());
             let their = self.their_call.clone().unwrap_or_default();
             let record = self.make_qso_record();

@@ -418,8 +418,8 @@ fn process_slot(
         // new decodes or just more duplicates / false positives.
         //
         // To restore strict mode: XMIN=1.0, MIN_FRAGS=2.
-        const ACCUM_XMIN: f32 = 0.5;
-        const ACCUM_MIN_FRAGS: usize = 1;
+        const ACCUM_XMIN: f32 = 1.0;
+        const ACCUM_MIN_FRAGS: usize = 2;
         // ────────────────────────────────────────────────────────────
 
         let fragments = msk144plus_engine::collect_softbit_fragments(

@@ -1029,7 +1029,7 @@ fn jigsaw_decode_cluster(cluster: &[&SoftbitFragment]) -> Option<DecodeEvent> {
     // ACCUM-TEST: lowered from 0.25 to 0.10 — weaker fragment regions
     // now contribute, increasing coverage at the cost of admitting
     // noisier softbits into the per-bit sum.
-    const ENVELOPE_THRESHOLD: f32 = 0.10;
+    const ENVELOPE_THRESHOLD: f32 = 0.25;
     const SMOOTH_HALFWIDTH: i32 = 2;  // 5-tap window: i-2..=i+2
     const NBITS: usize = 144;
 
@@ -1080,7 +1080,7 @@ fn jigsaw_decode_cluster(cluster: &[&SoftbitFragment]) -> Option<DecodeEvent> {
     // ACCUM-TEST: lowered from NBITS*2/3 (96) to NBITS/2 (72) — admit
     // sparser jigsaws. LDPC's own n_hard_errors check downstream
     // remains the final gate against pure noise decodes.
-    if covered_bits < NBITS / 2 { return None; }
+    if covered_bits < NBITS * 2 / 3 { return None; }
 
     // --- LDPC decode on the jigsawed result ---
     let llr = softbits_to_ldpc_llr(&final_soft);

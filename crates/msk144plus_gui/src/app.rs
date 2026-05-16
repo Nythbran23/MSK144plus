@@ -1288,6 +1288,184 @@ impl App {
         }
     }
 
+    /// Render the slot-period (15s / 30s) selector. Was originally in
+    /// the top bar next to MSK144 label; moved to the bottom Manual TX
+    /// strip as part of UI tidy-up. Operator's choice persists in
+    /// settings and propagates to the engine + transmitter via
+    /// sync_transmitter_config. Both ends of a QSO must use the same
+    /// period — there's no protocol negotiation, so the operator picks
+    /// based on regional convention (15s = WSJT-X / R2 / R3 default,
+    /// 30s = IARU R1 144 MHz MS).
+    fn render_slot_period_selector(&mut self, ui: &mut egui::Ui) {
+        let muted = egui::Color32::from_rgb(140, 140, 140);
+        // Clamp on read so a stale settings file with some other
+        // value coerces to 30s on first run.
+        let cur_period = if self.settings.station.slot_period_secs == 15 {
+            15
+        } else {
+            30
+        };
+        let cur_period_label = format!("{}s", cur_period);
+        let mut new_period: Option<u32> = None;
+        egui::ComboBox::from_id_source("slot_period_dropdown")
+            .selected_text(egui::RichText::new(cur_period_label).color(muted).strong())
+            .width(54.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(cur_period == 15,
+                    egui::RichText::new("15s").monospace())
+                    .on_hover_text(
+                        "15-second slots (WSJT-X / US default).\n\
+                         Used by most stations in IARU R2 / R3.\n\
+                         Both ends of a QSO must use the same period.")
+                    .clicked()
+                { new_period = Some(15); }
+                if ui.selectable_label(cur_period == 30,
+                    egui::RichText::new("30s").monospace())
+                    .on_hover_text(
+                        "30-second slots (IARU Region 1 specification\n\
+                         for 144 MHz meteor scatter).\n\
+                         Use this in Europe/Africa. Both ends of a\n\
+                         QSO must use the same period.")
+                    .clicked()
+                { new_period = Some(30); }
+            });
+        if let Some(p) = new_period {
+            if self.settings.station.slot_period_secs != p {
+                self.settings.station.slot_period_secs = p;
+                self.settings_dirty = true;
+                self.sync_transmitter_config();
+                if let Ok(mut c) = self.cfg.lock() {
+                    c.slot_period_secs = p;
+                }
+                log::info!("[UI] Slot period changed to {}s", p);
+            }
+        }
+    }
+
+    /// Render the in-QSO status cluster: distance/bearing, scatter
+    /// arc, beam A/B, midpoint elevation, QSO duration timer, and the
+    /// IN QSO / Watchdog button. Previously lived inline in the
+    /// actions strip alongside CALL — but when a QSO was active, that
+    /// row got too wide and crowded. Moved here so it can be rendered
+    /// in the top bar (next to MSK144 / period selector) leaving the
+    /// actions strip clean and uncluttered.
+    ///
+    /// Renders nothing when their_call is empty (no QSO context).
+    /// Distance/bearing alone when grids are known but no scatter
+    /// data computable. Full block (scatter arc + beam + elevation)
+    /// when compute_scatter_arc returns Some.
+    fn render_qso_status_cluster(&mut self, ui: &mut egui::Ui) {
+        if self.their_call.is_empty() && !self.in_active_qso {
+            return;
+        }
+        // Distance / bearing / scatter — same logic as the original
+        // inline block. Only renders if we have both grids parsed
+        // into geo::Qth coordinates.
+        if let (Some(my_grid), Some(their_grid)) = (
+            self.settings.station.grid.as_deref(),
+            self.their_grid.as_deref(),
+        ) {
+            if let (Some(my_qth), Some(their_qth)) = (
+                crate::geo::Qth::from_maidenhead(my_grid),
+                crate::geo::Qth::from_maidenhead(their_grid),
+            ) {
+                let dist = crate::geo::gc_distance_km(
+                    my_qth.lat, my_qth.lon,
+                    their_qth.lat, their_qth.lon);
+                let bearing = crate::geo::gc_bearing_deg(
+                    my_qth.lat, my_qth.lon,
+                    their_qth.lat, their_qth.lon);
+
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Distance")
+                        .small()
+                        .color(egui::Color32::from_gray(180)));
+                    ui.label(egui::RichText::new(format!(
+                        "{:.0} km  {:.0}°", dist, bearing))
+                        .monospace()
+                        .color(egui::Color32::from_rgb(180, 180, 255)));
+                });
+
+                if let Some(arc) = crate::geo::compute_scatter_arc(
+                    my_qth.lat, my_qth.lon,
+                    their_qth.lat, their_qth.lon,
+                    self.settings.station.ant_bw_horiz as f64,
+                ) {
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Scatter Arc")
+                            .small()
+                            .color(egui::Color32::from_gray(180)));
+                        ui.label(egui::RichText::new(format!(
+                            "{:.0}°–{:.0}°", arc.arc_min, arc.arc_max))
+                            .monospace()
+                            .color(egui::Color32::from_rgb(255, 200, 80)));
+                    });
+
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Beam A / B")
+                            .small()
+                            .color(egui::Color32::from_gray(180)));
+                        let txt = match (arc.beam_a, arc.beam_b) {
+                            (Some(a), Some(b)) => format!("{:.0}° / {:.0}°", a, b),
+                            (Some(c), None)    => format!("{:.0}°", c),
+                            _                  => "—".into(),
+                        };
+                        ui.label(egui::RichText::new(txt)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(100, 255, 180)));
+                    });
+
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("El")
+                            .small()
+                            .color(egui::Color32::from_gray(180)));
+                        let half_v = self.settings.station.ant_bw_vert as f64 / 2.0;
+                        let el_col = if arc.midpoint_el <= half_v {
+                            egui::Color32::from_rgb(255, 120, 80)
+                        } else {
+                            egui::Color32::from_gray(200)
+                        };
+                        ui.label(egui::RichText::new(format!(
+                            "{:.0}°", arc.midpoint_el))
+                            .monospace()
+                            .color(el_col));
+                    });
+                }
+            }
+        }
+
+        // IN QSO / WD button + duration timer (compact form for the
+        // top bar). Operator can toggle the watchdog on/off here as
+        // before. Duration shown in MM:SS to the left of the button.
+        if self.in_active_qso || !self.their_call.is_empty() {
+            ui.add_space(10.0);
+            let qso_green = egui::Color32::from_rgb(56, 120, 70);
+            if let Some(started) = self.qso_started_at {
+                let elapsed = started.elapsed().as_secs();
+                ui.label(egui::RichText::new(format!("{:02}:{:02}",
+                    elapsed / 60, elapsed % 60))
+                    .monospace().small().color(egui::Color32::GRAY));
+            }
+            let wd_color = if self.watchdog_enabled { qso_green }
+                else { egui::Color32::from_rgb(100, 40, 40) };
+            let wd_label = if self.watchdog_enabled {
+                "⏰ IN QSO  WD ON"
+            } else {
+                "⏰ IN QSO  WD OFF"
+            };
+            if ui.add_sized([150.0, 28.0],
+                egui::Button::new(egui::RichText::new(wd_label)
+                    .strong()
+                    .color(egui::Color32::WHITE))
+                    .fill(wd_color)).clicked()
+            {
+                self.watchdog_enabled = !self.watchdog_enabled;
+            }
+        }
+    }
+
     fn apply_manual_tx_override(&mut self, state: dx_runtime::qso::QsoState) {
         // Defensive re-parse of the typed Rpt field BEFORE we read
         // `self.manual_tx_rpt`. The Manual TX dropdown sits ABOVE the
@@ -2425,72 +2603,34 @@ impl eframe::App for App {
                 // can flip to 15s if working US/R2/R3 stations or
                 // band conditions warrant.
                 ui.add_space(15.0);
-                let muted = egui::Color32::from_rgb(140, 140, 140);
                 let mode_blue = egui::Color32::from_rgb(100, 180, 220);
                 ui.label(egui::RichText::new("MSK144").color(mode_blue));
-                ui.label(egui::RichText::new("•").color(muted).weak());
 
-                // Clamp to the two legal values on read so a stale
-                // settings file with some other number (a development
-                // artefact) gets coerced to 30s on first run.
-                let cur_period = if self.settings.station.slot_period_secs == 15 {
-                    15
-                } else {
-                    30
-                };
-                let cur_period_label = format!("{}s", cur_period);
-                let mut new_period: Option<u32> = None;
-                egui::ComboBox::from_id_source("slot_period_dropdown")
-                    .selected_text(egui::RichText::new(cur_period_label).color(muted).strong())
-                    .width(54.0)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(cur_period == 15,
-                            egui::RichText::new("15s").monospace())
-                            .on_hover_text(
-                                "15-second slots (WSJT-X / US default).\n\
-                                 Used by most stations in IARU R2 / R3.\n\
-                                 Both ends of a QSO must use the same period.")
-                            .clicked()
-                        { new_period = Some(15); }
-                        if ui.selectable_label(cur_period == 30,
-                            egui::RichText::new("30s").monospace())
-                            .on_hover_text(
-                                "30-second slots (IARU Region 1 specification\n\
-                                 for 144 MHz meteor scatter).\n\
-                                 Use this in Europe/Africa. Both ends of a\n\
-                                 QSO must use the same period.")
-                            .clicked()
-                        { new_period = Some(30); }
-                    });
-                if let Some(p) = new_period {
-                    if self.settings.station.slot_period_secs != p {
-                        self.settings.station.slot_period_secs = p;
-                        self.settings_dirty = true;
-                        self.sync_transmitter_config();
-                        // The decoder framer reads slot_period_secs
-                        // from the shared cfg Arc each pass, so the
-                        // change takes effect on the next slot drain.
-                        // Spectrum buffer self-resets when slot_idx
-                        // jumps (which it will since slot_period_ms
-                        // just changed).
-                        if let Ok(mut c) = self.cfg.lock() {
-                            c.slot_period_secs = p;
-                        }
-                        log::info!("[UI] Slot period changed to {}s", p);
-                    }
-                }
+                // Slot period (15s / 30s) selector previously lived
+                // here next to the MSK144 label. It has been moved to
+                // the Manual TX strip above the spectrum so all the
+                // "operator preference" controls (parity, period,
+                // Manual TX, Rpt, Sh) live together. The mode label
+                // alone stays here as it's the only mode this app
+                // supports.
 
-                // Operator's TX-control cluster (TX parity, Manual TX,
-                // Rpt, Sh) — render inline on row 1 if the window is
-                // wide enough; otherwise an "overflow" panel below
-                // catches it on its own row. Threshold is the
-                // approximate sum of the inline cluster widths plus
-                // the leading callsign/freq/mode/period and trailing
-                // clock+cog. Tweak if fonts or labels change.
-                if !self.compact_top_bar {
-                    ui.add_space(12.0);
-                    self.render_tx_controls_cluster(ui);
-                }
+                // In-QSO status cluster — distance, scatter arc, beam
+                // headings, midpoint elevation, QSO duration timer,
+                // and the IN QSO / Watchdog button. Renders nothing
+                // when no QSO is active. Previously lived in the
+                // actions strip alongside CALL, but that row got
+                // unworkably wide when a QSO with full grid info was
+                // active. Hoisting it to the top bar leaves the
+                // actions strip clean.
+                self.render_qso_status_cluster(ui);
+
+                // TX controls cluster (parity + Manual TX + Rpt + Sh)
+                // was previously rendered here in the top bar. It has
+                // been moved to the bottom of the TX column (left side
+                // of the central panel) so all TX-related controls
+                // live together. The top bar now stays clean with just
+                // status + actions, freeing horizontal space and
+                // removing the compact-overflow row entirely.
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙").clicked() {
@@ -2503,13 +2643,13 @@ impl eframe::App for App {
             });
         });
 
-        // ── Top-bar overflow row (only when compact) ──────────────────────────
-        // When the window is too narrow for the full row 1, the
-        // TX-control cluster (parity + Manual TX + Rpt + Sh) lands
-        // here on its own line between row 1 and the actions strip.
-        // When the window is wide, the cluster renders inline on
-        // row 1 and this panel doesn't appear at all.
-        if self.compact_top_bar {
+        // ── Top-bar overflow row ──────────────────────────────────────────────
+        // Previously, when the window was narrow, the TX-control cluster
+        // dropped onto a second top-bar row. Now that the cluster has
+        // moved to the TX column, the overflow row is no longer needed.
+        // Left as a no-op for now; can be removed entirely once we're
+        // confident the move stays.
+        if false && self.compact_top_bar {
             egui::TopBottomPanel::top("top_bar_overflow").show(ctx, |ui| {
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
@@ -2747,96 +2887,12 @@ impl eframe::App for App {
                     }
                 }
 
-                // ── Distance / bearing / scatter / A & B beam headings ─
-                // Shown when we know both my grid and their grid (4-char
-                // Maidenhead minimum, calculated to centre of the square
-                // per Roger's spec). Visual matches FSK441Plus: vertical
-                // label-over-value pairs separated by ui.separator().
-                //
-                // Distance + GC bearing always shown.
-                // Scatter arc shown only when compute_scatter_arc returns
-                // Some — for very short paths the arc is undefined.
-                if !self.their_call.is_empty() {
-                    if let (Some(my_grid), Some(their_grid)) = (
-                        self.settings.station.grid.as_deref(),
-                        self.their_grid.as_deref(),
-                    ) {
-                        if let (Some(my_qth), Some(their_qth)) = (
-                            crate::geo::Qth::from_maidenhead(my_grid),
-                            crate::geo::Qth::from_maidenhead(their_grid),
-                        ) {
-                            let dist = crate::geo::gc_distance_km(
-                                my_qth.lat, my_qth.lon,
-                                their_qth.lat, their_qth.lon);
-                            let bearing = crate::geo::gc_bearing_deg(
-                                my_qth.lat, my_qth.lon,
-                                their_qth.lat, their_qth.lon);
-
-                            ui.separator();
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("Distance")
-                                    .small()
-                                    .color(egui::Color32::from_gray(180)));
-                                ui.label(egui::RichText::new(format!(
-                                    "{:.0} km  {:.0}°", dist, bearing))
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(180, 180, 255)));
-                            });
-
-                            if let Some(arc) = crate::geo::compute_scatter_arc(
-                                my_qth.lat, my_qth.lon,
-                                their_qth.lat, their_qth.lon,
-                                self.settings.station.ant_bw_horiz as f64,
-                            ) {
-                                ui.separator();
-                                ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new("Scatter Arc")
-                                        .small()
-                                        .color(egui::Color32::from_gray(180)));
-                                    ui.label(egui::RichText::new(format!(
-                                        "{:.0}°–{:.0}°", arc.arc_min, arc.arc_max))
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(255, 200, 80)));
-                                });
-
-                                ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new("Beam A / B")
-                                        .small()
-                                        .color(egui::Color32::from_gray(180)));
-                                    let txt = match (arc.beam_a, arc.beam_b) {
-                                        (Some(a), Some(b)) => format!("{:.0}° / {:.0}°", a, b),
-                                        (Some(c), None)    => format!("{:.0}°", c),
-                                        _                  => "—".into(),
-                                    };
-                                    ui.label(egui::RichText::new(txt)
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(100, 255, 180)));
-                                });
-
-                                ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new("El")
-                                        .small()
-                                        .color(egui::Color32::from_gray(180)));
-                                    // Red when the midpoint elevation
-                                    // sits below the upper half of the
-                                    // antenna's vertical lobe (i.e. main
-                                    // lobe is pointing too low for this
-                                    // path). Otherwise neutral grey.
-                                    let half_v = self.settings.station.ant_bw_vert as f64 / 2.0;
-                                    let el_col = if arc.midpoint_el <= half_v {
-                                        egui::Color32::from_rgb(255, 120, 80)
-                                    } else {
-                                        egui::Color32::from_gray(200)
-                                    };
-                                    ui.label(egui::RichText::new(format!(
-                                        "{:.0}°", arc.midpoint_el))
-                                        .monospace()
-                                        .color(el_col));
-                                });
-                            }
-                        }
-                    }
-                }
+                // The distance / scatter arc / beam / elevation /
+                // QSO duration / IN QSO+WD cluster previously rendered
+                // here has been hoisted into the top bar (via
+                // render_qso_status_cluster), called from the top_bar
+                // panel next to the MSK144 label. Keeps the actions
+                // strip narrow when a QSO is active.
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⏹ STOP").clicked() {
@@ -2846,24 +2902,6 @@ impl eframe::App for App {
                         self.in_active_qso = false;
                         self.qso_started_at = None;
                         self.stop();
-                    }
-                    if self.in_active_qso || !self.their_call.is_empty() {
-                        ui.add_space(10.0);
-                        let qso_green = egui::Color32::from_rgb(56, 120, 70);
-                        if let Some(started) = self.qso_started_at {
-                            let elapsed = started.elapsed().as_secs();
-                            ui.label(egui::RichText::new(format!("{:02}:{:02}", elapsed / 60, elapsed % 60))
-                                .monospace().small().color(egui::Color32::GRAY));
-                        }
-                        let wd_color = if self.watchdog_enabled { qso_green }
-                            else { egui::Color32::from_rgb(100, 40, 40) };
-                        let wd_label = if self.watchdog_enabled { "⏰ IN QSO  WD ON" } else { "⏰ IN QSO  WD OFF" };
-                        if ui.add_sized([150.0, 30.0],
-                            egui::Button::new(egui::RichText::new(wd_label).strong().color(egui::Color32::WHITE))
-                                .fill(wd_color)).clicked()
-                        {
-                            self.watchdog_enabled = !self.watchdog_enabled;
-                        }
                     }
                 });
             });
@@ -2882,42 +2920,44 @@ impl eframe::App for App {
                 for i in 0..3 {
                     cols[i].vertical(|ui| {
                         ui.horizontal(|ui| {
-                            let label = match i { 0 => "📥 RX", 1 => "📤 TX", _ => "🎯 SPOTS" };
-                            if i == 1 && self.is_transmitting {
+                            // Column index → logical column type:
+                            //   i=0 → TX (was RX)
+                            //   i=1 → RX (was TX)
+                            //   i=2 → SPOTS (unchanged)
+                            // Order swap: operator's eye naturally goes to
+                            // decoded messages (RX), which now sit in the
+                            // visual centre. TX moves to the left where
+                            // outgoing message tracking is grouped with
+                            // the relocated Manual TX controls below the
+                            // scrolling history.
+                            let label = match i { 0 => "📤 TX", 1 => "📥 RX", _ => "🎯 SPOTS" };
+                            if i == 0 && self.is_transmitting {
                                 ui.heading(egui::RichText::new(label).color(egui::Color32::from_rgb(255, 50, 50)));
                             } else {
                                 ui.heading(label);
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("🗑").clicked() {
-                                    match i { 0 => self.rx_log.clear(), 1 => self.tx_log.clear(), _ => self.cq_log.clear() };
+                                    match i { 0 => self.tx_log.clear(), 1 => self.rx_log.clear(), _ => self.cq_log.clear() };
                                 }
                             });
                         });
 
-                        let id = match i { 0 => "rx_sc", 1 => "tx_sc", _ => "cq_sc" };
+                        let id = match i { 0 => "tx_sc", 1 => "rx_sc", _ => "cq_sc" };
                         // ScrollArea sizing: auto_shrink([false, false])
                         // tells the area to claim ALL the available
                         // height in the parent column rather than
                         // shrinking to fit content. Without this the
                         // column grows vertically with content, pushing
-                        // the central panel beyond the viewport (which
-                        // is why the bug looked like "scrolling
-                        // disappeared" — content was overflowing the
-                        // panel rather than the scroll area handling
-                        // it). The previous max_height(available_height)
-                        // approach didn't work because available_height
-                        // inside cols+vertical doesn't bound a fixed
-                        // viewport — it just reports remaining space
-                        // which is unbounded as content grows.
+                        // the central panel beyond the viewport.
                         egui::ScrollArea::vertical()
                             .id_source(id)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            let log = match i { 0 => &self.rx_log, 1 => &self.tx_log, _ => &self.cq_log };
+                            let log = match i { 0 => &self.tx_log, 1 => &self.rx_log, _ => &self.cq_log };
                             for entry in log.iter().rev() {
-                                if i == 1 {
+                                if i == 0 {
                                     // TX rows: tint by the operator's CURRENT
                                     // TX parity setting (this is the slot we
                                     // transmit IN, by definition). The colour
@@ -3385,6 +3425,28 @@ impl eframe::App for App {
                     }
                 }
             }
+        });
+
+        // ── Manual TX controls strip ──────────────────────────────────────────
+        // Horizontal panel containing slot-period (15s/30s) selector,
+        // parity (TX slot) selector, Manual TX dropdown, Rpt field,
+        // Sh checkbox. Previously the period selector was in the top
+        // bar next to MSK144 and the TX cluster was also in the top
+        // bar; both moved here to declutter the top of the window
+        // and group operator preference controls visually near the
+        // spectrum and status strips. The cluster functions themselves
+        // are unchanged — all wiring to engine / settings paths is
+        // identical. Order in this strip: period FIRST (leftmost),
+        // then a separator, then TX cluster.
+        egui::TopBottomPanel::bottom("tx_controls_strip").show(ctx, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label("Period:");
+                self.render_slot_period_selector(ui);
+                ui.separator();
+                self.render_tx_controls_cluster(ui);
+            });
+            ui.add_space(3.0);
         });
 
         // ── Settings dialog ───────────────────────────────────────────────────
