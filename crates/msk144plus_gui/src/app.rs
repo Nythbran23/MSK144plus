@@ -54,6 +54,17 @@ struct LogEntry {
     /// the +NN report quantised to MSK144's 2-dB-step protocol range.
     /// `None` for rows that aren't decodes (e.g. TX entries, info messages).
     snr_db: Option<i16>,
+    /// For TX-column message rows: how many times this exact message
+    /// has been transmitted on the air so far. The TX column collapses
+    /// consecutive identical transmissions into ONE row and ticks this
+    /// counter, instead of appending a fresh row every slot. So a
+    /// 10-minute CQ run shows as a single `06:54 CQ GW4WND IO82 [20]`
+    /// row rather than 20 identical lines. The row is rendered as
+    /// `HH:MM  <message>  [N]`; `timestamp` holds the START time (first
+    /// TX of this message), so the operator can see how long they've
+    /// been sending it. `None` for RX/CQ rows and for TX info banners
+    /// (QSO-complete, encode-failed) which are genuine one-offs.
+    repeat_count: Option<u32>,
 }
 
 pub struct App {
@@ -1830,6 +1841,7 @@ impl App {
                         timestamp: chrono::Utc::now().format("%H%M%S").to_string(),
                         rx_slot: None,
                     snr_db: None,
+                        repeat_count: None,
                     });
                     let had_record = record.is_some();
                     if let (Some(adif), Some(rec)) = (self.adif.as_ref(), record) {
@@ -1934,15 +1946,47 @@ impl App {
                     //     the ring buffer stays clean and the next save's
                     //     pre-roll is the pre-TX RX audio, not our own TX).
                     self.recorder.set_tx_active(true);
-                    // One entry per real transmission, logged at slot start
-                    // with the actual UTC time the slot fired.
-                    self.tx_log.push(LogEntry {
-                        text: message,
-                        colored: true,
-                        timestamp: chrono::Utc::now().format("%H%M%S").to_string(),
-                        rx_slot: None,
-                        snr_db: None,
-                    });
+                    // TX column entry. Consecutive transmissions of the
+                    // SAME message text collapse into a single row whose
+                    // [N] counter ticks each slot — instead of appending
+                    // an identical line every slot. A 10-minute CQ run
+                    // is one row `06:54 CQ GW4WND IO82 [20]`, not 20
+                    // copies. The row's `timestamp` is the START time
+                    // (first TX of this message) so the operator can see
+                    // how long they've held it — particularly useful for
+                    // RR73, which has no auto-timeout, so a high count
+                    // there is the cue to consider LOG QSO.
+                    //
+                    // "Same message" = exact text match against the LAST
+                    // tx_log row, AND that row must itself be a counted
+                    // TX row (repeat_count.is_some()). Any text change,
+                    // or an intervening info banner (QSO-complete /
+                    // encode-failed, which have repeat_count = None),
+                    // starts a fresh row. This is the "new line on any
+                    // change" rule.
+                    //
+                    // Reached only from TxEvent::Started — i.e. a real
+                    // on-air transmission. TX suppressed by the TX-Enable
+                    // gate never emits Started, so the column correctly
+                    // does not move when we're not actually transmitting.
+                    let collapse = self.tx_log.last()
+                        .map(|e| e.repeat_count.is_some() && e.text == message)
+                        .unwrap_or(false);
+                    if collapse {
+                        if let Some(last) = self.tx_log.last_mut() {
+                            last.repeat_count =
+                                Some(last.repeat_count.unwrap_or(1) + 1);
+                        }
+                    } else {
+                        self.tx_log.push(LogEntry {
+                            text: message,
+                            colored: true,
+                            timestamp: chrono::Utc::now().format("%H:%M").to_string(),
+                            rx_slot: None,
+                            snr_db: None,
+                            repeat_count: Some(1),
+                        });
+                    }
                     if self.tx_log.len() > 200 {
                         let n = self.tx_log.len() - 200;
                         self.tx_log.drain(..n);
@@ -2009,6 +2053,7 @@ impl App {
                         timestamp: chrono::Utc::now().format("%H%M%S").to_string(),
                         rx_slot: None,
                     snr_db: None,
+                        repeat_count: None,
                     });
                 }
             }
@@ -2214,6 +2259,7 @@ impl App {
                         timestamp: String::new(),
                         rx_slot: parity,
                         snr_db: Some(snr_db),
+                        repeat_count: None,
                     });
                     if self.rx_log.len() > 500 {
                         let n = self.rx_log.len() - 500;
@@ -2229,6 +2275,7 @@ impl App {
                         timestamp: String::new(),
                         rx_slot: parity,
                         snr_db: Some(snr_db),
+                        repeat_count: None,
                     });
                     if self.cq_log.len() > 200 {
                         let n = self.cq_log.len() - 200;
@@ -2971,12 +3018,24 @@ impl eframe::App for App {
                                     let tx_parity = tx_parity_to_int(
                                         &self.settings.station.tx_parity);
                                     let tx_bar = parity_accent(tx_parity);
+                                    // Display string for a TX row. Counted
+                                    // message rows (repeat_count = Some) get
+                                    // the `HH:MM  <message>  [N]` form — start
+                                    // time, message, on-air repeat count.
+                                    // Info banners (repeat_count = None:
+                                    // QSO-complete, encode-failed) render
+                                    // their text verbatim, no time/count.
+                                    let tx_row_text = match entry.repeat_count {
+                                        Some(n) => format!("{}  {}  [{}]",
+                                            entry.timestamp, entry.text, n),
+                                        None => entry.text.clone(),
+                                    };
                                     ui.allocate_ui(egui::vec2(ui.available_width(), 18.0), |ui| {
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             if entry.colored {
                                                 let frame_resp = egui::Frame::none()
                                                     .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                                    .show(ui, |ui| { ui.monospace(&entry.text); });
+                                                    .show(ui, |ui| { ui.monospace(&tx_row_text); });
                                                 let rect = ui.max_rect();
                                                 let bar = egui::Rect::from_min_max(
                                                     egui::pos2(rect.max.x - 3.0, rect.min.y),
@@ -2989,7 +3048,7 @@ impl eframe::App for App {
                                                     }
                                                 });
                                             } else {
-                                                let lab = ui.monospace(&entry.text);
+                                                let lab = ui.monospace(&tx_row_text);
                                                 lab.context_menu(|ui| {
                                                     if ui.button("📋 Copy TX").clicked() {
                                                         ui.output_mut(|o| o.copied_text = entry.text.clone());
